@@ -14,7 +14,9 @@
   h2{font-size:1.05rem;margin:0 0 8px}
   .card{background:var(--card);border:1px solid var(--bd);border-radius:12px;padding:16px;margin-bottom:16px}
   label{display:block;font-size:.85rem;color:var(--mut);margin:12px 0 4px}
+  label:first-child{margin-top:0}
   input,textarea{width:100%;padding:10px;border:1px solid var(--bd);border-radius:8px;background:var(--bg);color:var(--fg);font:inherit}
+  input[type=checkbox]{width:auto}
   textarea{font-size:.8rem;word-break:break-all}
   .row{display:grid;grid-template-columns:1fr 1fr;gap:12px}
   .btns{display:flex;gap:8px;flex-wrap:wrap;margin-top:16px}
@@ -26,7 +28,8 @@
   .tabs button{flex:1;background:transparent;color:var(--fg);border:1px solid var(--bd)}
   .tabs button.on{background:var(--acc);color:#fff;border-color:var(--acc)}
   .pill{display:inline-block;padding:2px 10px;border-radius:99px;font-size:.8rem;font-weight:600;border:1px solid var(--bd)}
-  .bar{height:10px;border-radius:99px;background:var(--bd);overflow:hidden;margin:12px 0 8px}
+  .big{font-size:2rem;font-weight:700;line-height:1.1;margin:10px 0 0}
+  .bar{height:10px;border-radius:99px;background:var(--bd);overflow:hidden;margin:10px 0 8px}
   .bar>div{height:100%;width:0;background:var(--acc);transition:width .4s}
   .stats{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;text-align:center;font-size:.85rem;color:var(--mut)}
   .stats b{display:block;font-size:1.1rem;color:var(--fg)}
@@ -35,6 +38,7 @@
   .err{color:var(--bad)}.good{color:var(--ok)}.warn{color:var(--warn)}
   small,.hint{color:var(--mut);font-size:.8rem}
   .hint{display:block;margin-top:6px}
+  .ck{display:flex;align-items:center;gap:8px;margin-top:12px;font-size:.9rem}
   dialog{border:1px solid var(--bd);border-radius:14px;background:var(--card);color:var(--fg);padding:20px;width:min(92vw,460px)}
   dialog::backdrop{background:rgba(0,0,0,.5)}
   .chk{display:flex;gap:10px;padding:10px 0;border-top:1px solid var(--bd)}
@@ -48,10 +52,16 @@
 <main>
   <h1>Channel Copier</h1>
 
+  <!-- PIN first: nothing works without it -->
   <div class="card">
-    <label for="api">Render URL</label>
-    <input id="api" placeholder="https://your-bot.onrender.com" autocomplete="off">
+    <label for="pin">PIN</label>
+    <input id="pin" type="password" inputmode="numeric" maxlength="4" autocomplete="off" placeholder="4-digit PIN set in Render">
+    <label for="api">Server (Render) URL</label>
+    <input id="api" autocomplete="off">
+    <small class="hint">This static page runs in your browser, so it needs to know where your server lives. The PIN is kept only until this tab is closed.</small>
+  </div>
 
+  <div class="card">
     <label>Copy using</label>
     <div class="tabs">
       <button type="button" id="tBot" class="on">Bot token</button>
@@ -62,17 +72,22 @@
       <label for="token">Bot token</label>
       <input id="token" type="password" autocomplete="off" placeholder="123456:ABC-DEF… (blank = token set in Render)">
       <small class="hint">Bot must be admin in the source and in the destination channel.</small>
+      <label for="notifyId">Send progress to Telegram user ID (optional)</label>
+      <input id="notifyId" inputmode="numeric" autocomplete="off" placeholder="123456789">
+      <small class="hint">That user must have pressed Start on the bot once. One message is edited in place.</small>
     </div>
 
     <div id="userBox" class="hide">
-      <div class="row">
-        <div><label for="apiId">API ID</label><input id="apiId" inputmode="numeric" autocomplete="off" placeholder="1234567"></div>
-        <div><label for="apiHash">API hash</label><input id="apiHash" type="password" autocomplete="off" placeholder="32 characters"></div>
-      </div>
       <label for="session">Session string</label>
-      <textarea id="session" rows="3" autocomplete="off" spellcheck="false" placeholder="Paste a saved session, or press Generate session"></textarea>
+      <textarea id="session" rows="3" autocomplete="off" spellcheck="false" placeholder="Paste a saved session, or generate one below"></textarea>
+      <small class="hint">GramJS / Telethon string session. Account needs to be a member of the source and admin of the destination.</small>
+      <div class="row">
+        <div><label for="apiId">API ID (optional)</label><input id="apiId" inputmode="numeric" autocomplete="off" placeholder="1234567"></div>
+        <div><label for="apiHash">API hash (optional)</label><input id="apiHash" type="password" autocomplete="off" placeholder="32 characters"></div>
+      </div>
+      <small class="hint">Leave empty if API_ID / API_HASH are set on Render. Needed only to log in and generate a new session.</small>
       <div class="btns" style="margin-top:8px"><button type="button" id="bGen" class="sec">Generate session (OTP)</button></div>
-      <small class="hint">Account only needs to be a member of the source and an admin of the destination. API ID/hash come from my.telegram.org.</small>
+      <label class="ck"><input id="notifySaved" type="checkbox" checked> Show progress in my “Saved Messages”</label>
     </div>
 
     <label for="src">Source channel ID</label>
@@ -86,8 +101,9 @@
       <div><label for="to">End message ID</label><input id="to" type="number" min="1" placeholder="500"></div>
     </div>
 
-    <label for="pin">PIN</label>
-    <input id="pin" type="password" inputmode="numeric" maxlength="4" autocomplete="off" placeholder="4-digit PIN set in Render env">
+    <label for="delay">Delay between messages (seconds)</label>
+    <input id="delay" type="number" min="0.5" max="60" step="0.5" value="3">
+    <small class="hint">3 s = Telegram's 20 messages/minute per chat. Lower is faster but triggers flood waits (handled automatically).</small>
 
     <div class="btns">
       <button id="bCheck" class="sec">Check setup</button>
@@ -96,11 +112,13 @@
       <button id="bStop" class="stop">Stop</button>
     </div>
     <div id="msg"></div>
-    <small>The first request can take ~1 minute if Render was asleep. Tokens and sessions are never saved in this page.</small>
+    <small>First request can take ~1 minute if Render was asleep. Tokens, sessions and hashes are never saved in this page.</small>
   </div>
 
   <div class="card">
     <div><span id="status" class="pill">no data</span> <small id="route"></small></div>
+    <div class="big" id="pct">–</div>
+    <small id="cur"></small>
     <div class="bar"><div id="fill"></div></div>
     <div class="stats">
       <div><b id="sCopied">–</b>copied</div>
@@ -124,7 +142,7 @@
   <div id="sPhone">
     <label for="sp">Phone number (with country code)</label>
     <input id="sp" placeholder="+919876543210" inputmode="tel" autocomplete="off">
-    <small class="hint">Uses the API ID / hash entered on the page. Telegram sends a login code to your Telegram app.</small>
+    <small class="hint">Uses the API ID / hash from the page (or the ones set on Render). Telegram sends a login code to your Telegram app.</small>
     <div class="btns"><button id="sSend">Send code</button><button class="sec" data-close>Cancel</button></div>
   </div>
   <div id="sCode" class="hide">
@@ -147,14 +165,25 @@
 
 <script>
 const $ = (id) => document.getElementById(id);
-const SAVE = ['api', 'src', 'dst', 'from', 'to', 'apiId']; // secrets (token, hash, session, PIN) are never stored
+const DEFAULT_URL = 'https://tg-channel-clone.onrender.com';
+const SAVE = ['api', 'src', 'dst', 'from', 'to', 'apiId', 'delay', 'notifyId']; // non-secret only
 let mode = 'bot';
 
+$('api').value = DEFAULT_URL;
 try {
   SAVE.forEach((k) => { const v = localStorage.getItem('cc_' + k); if (v) $(k).value = v; });
+  const ns = localStorage.getItem('cc_notifySaved'); if (ns !== null) $('notifySaved').checked = ns === '1';
   if (localStorage.getItem('cc_mode') === 'user') setMode('user');
+  const p = sessionStorage.getItem('cc_pin'); if (p) $('pin').value = p; // survives reload, gone when the tab closes
 } catch {}
-const persist = () => { try { SAVE.forEach((k) => localStorage.setItem('cc_' + k, $(k).value)); localStorage.setItem('cc_mode', mode); } catch {} };
+const persist = () => {
+  try {
+    SAVE.forEach((k) => localStorage.setItem('cc_' + k, $(k).value));
+    localStorage.setItem('cc_notifySaved', $('notifySaved').checked ? '1' : '0');
+    localStorage.setItem('cc_mode', mode);
+  } catch {}
+};
+$('pin').addEventListener('input', () => { try { sessionStorage.setItem('cc_pin', $('pin').value); } catch {} if ($('pin').value.length === 4) refresh(false); });
 
 function setMode(m) {
   mode = m;
@@ -170,7 +199,7 @@ function say(text, cls) { const m = $('msg'); m.textContent = text; m.className 
 
 async function call(path, extra) {
   const base = $('api').value.trim().replace(/\/+$/, '');
-  if (!base) throw new Error('Enter the Render URL');
+  if (!base) throw new Error('Enter the server URL');
   const pin = $('pin').value;
   if (!pin) throw new Error('Enter the PIN');
   const ctl = new AbortController();
@@ -194,9 +223,9 @@ async function call(path, extra) {
 
 // everything the server needs to run a job, per the selected mode
 function jobFields() {
-  const base = { mode, source: $('src').value.trim(), dest: $('dst').value.trim() };
-  if (mode === 'bot') return { ...base, token: $('token').value.trim() };
-  return { ...base, apiId: $('apiId').value.trim(), apiHash: $('apiHash').value.trim(), session: $('session').value.trim() };
+  const base = { mode, source: $('src').value.trim(), dest: $('dst').value.trim(), delaySec: $('delay').value };
+  if (mode === 'bot') return { ...base, token: $('token').value.trim(), notifyUserId: $('notifyId').value.trim() };
+  return { ...base, apiId: $('apiId').value.trim(), apiHash: $('apiHash').value.trim(), session: $('session').value.trim(), notifySaved: $('notifySaved').checked };
 }
 
 function render(s) {
@@ -206,8 +235,11 @@ function render(s) {
   const name = (t, id) => (t ? `${t}` : id);
   $('route').textContent = s.source ? `${name(s.sourceTitle, s.source)} → ${name(s.destTitle, s.dest)} · ${s.mode === 'user' ? 'account ' : 'bot '}${s.accountName || ''}` : '';
   const total = s.to && s.from ? s.to - s.from + 1 : 0;
-  const done = s.next && s.from ? Math.min(total, s.next - s.from) : 0;
-  $('fill').style.width = total ? (100 * done / total).toFixed(1) + '%' : '0';
+  const done = s.next && s.from ? Math.max(0, Math.min(total, s.next - s.from)) : 0;
+  const pct = total ? 100 * done / total : 0;
+  $('fill').style.width = pct.toFixed(1) + '%';
+  $('pct').textContent = total ? pct.toFixed(1) + '%' : '–';
+  $('cur').textContent = total ? (s.status === 'done' ? `All ${total} IDs processed (${s.from}–${s.to})` : `Now at message ${Math.min(s.next, s.to)} · range ${s.from}–${s.to}`) : '';
   $('sCopied').textContent = s.copied ?? '–';
   $('sSkipped').textContent = s.skipped ?? '–';
   $('sNext').textContent = s.next ?? '–';
@@ -250,6 +282,7 @@ $('bCheck').onclick = async (e) => {
     body.appendChild(row(true, (r.mode === 'user' ? 'Account: ' : 'Bot: ') + r.account.name, [r.account.username, 'ID ' + r.account.id]));
     body.appendChild(row(r.source.ok, 'Source: ' + (r.source.title || r.source.id), [`Role: ${r.source.role || '—'}`, r.source.ok ? 'Can read from here' : r.source.note]));
     body.appendChild(row(r.dest.ok, 'Destination: ' + (r.dest.title || r.dest.id), [`Role: ${r.dest.role || '—'}`, r.dest.ok ? 'Can post here' : r.dest.note]));
+    if (r.notify) body.appendChild(row(r.notify.ok, 'Progress messages: ' + r.notify.name, [r.notify.ok ? 'Progress will be shown here' : r.notify.note]));
     const sum = document.createElement('p'); sum.className = r.ok ? 'good' : 'err';
     sum.textContent = r.ok ? 'All good. You can press Start.' : 'Fix the items marked ❌, then check again.';
     body.appendChild(sum);
@@ -281,7 +314,8 @@ $('sPassGo').onclick = (e) => sRun(e.target, () => call('/session/password', { p
 $('sCopy').onclick = async () => { try { await navigator.clipboard.writeText($('session').value); $('sMsg').textContent = ''; $('sCopy').textContent = 'Copied'; } catch { $('session').select(); } };
 document.querySelectorAll('[data-close]').forEach((b) => b.onclick = () => { $('dSess').close(); call('/session/cancel', {}).catch(() => {}); $('sp').value = ''; });
 
-// auto-refresh every 5s while the tab is open and a PIN is typed
+// show progress right after a reload (PIN comes back from this tab's session) and keep it fresh
+if ($('pin').value.length === 4) refresh(true);
 setInterval(() => { if ($('pin').value && $('api').value && !document.hidden) refresh(true); }, 5000);
 </script>
 </body>
