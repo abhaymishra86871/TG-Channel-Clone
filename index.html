@@ -10,7 +10,9 @@
   *{box-sizing:border-box}
   body{margin:0;background:var(--bg);color:var(--fg);font:16px/1.45 system-ui,sans-serif;padding:16px}
   main{max-width:560px;margin:0 auto}
-  h1{font-size:1.3rem;margin:8px 0 16px}
+  h1{font-size:1.3rem;margin:0}
+  header{display:flex;align-items:center;justify-content:space-between;gap:12px;margin:8px 0 16px}
+  button.danger{background:transparent;color:var(--bad);border:1px solid var(--bad);padding:6px 12px;font-size:.85rem}
   h2{font-size:1.05rem;margin:0 0 8px}
   .card{background:var(--card);border:1px solid var(--bd);border-radius:12px;padding:16px;margin-bottom:16px}
   label{display:block;font-size:.85rem;color:var(--mut);margin:12px 0 4px}
@@ -50,7 +52,10 @@
 </head>
 <body>
 <main>
-  <h1>Channel Copier</h1>
+  <header>
+    <h1>Channel Copier</h1>
+    <button type="button" id="bClear" class="danger">Clear all data</button>
+  </header>
 
   <!-- PIN first: nothing works without it -->
   <div class="card">
@@ -313,6 +318,18 @@ $('sVerify').onclick = (e) => sRun(e.target, () => call('/session/code', { code:
 $('sPassGo').onclick = (e) => sRun(e.target, () => call('/session/password', { password: $('sw').value }));
 $('sCopy').onclick = async () => { try { await navigator.clipboard.writeText($('session').value); $('sMsg').textContent = ''; $('sCopy').textContent = 'Copied'; } catch { $('session').select(); } };
 document.querySelectorAll('[data-close]').forEach((b) => b.onclick = () => { $('dSess').close(); call('/session/cancel', {}).catch(() => {}); $('sp').value = ''; });
+
+// ----- Clear all data (manual): wipes saved fields, PIN and everything typed on the page -----
+$('bClear').onclick = () => {
+  if (!confirm('Clear all saved and typed data on this page (URL, IDs, delay, PIN, token, session, API hash)?')) return;
+  try { Object.keys(localStorage).filter((k) => k.startsWith('cc_')).forEach((k) => localStorage.removeItem(k)); } catch {}
+  try { Object.keys(sessionStorage).filter((k) => k.startsWith('cc_')).forEach((k) => sessionStorage.removeItem(k)); } catch {}
+  ['pin', 'token', 'notifyId', 'session', 'apiId', 'apiHash', 'src', 'dst', 'from', 'to'].forEach((id) => { $(id).value = ''; });
+  $('api').value = DEFAULT_URL; $('delay').value = '3'; $('notifySaved').checked = true;
+  setMode('bot');
+  render({ status: 'no data', logs: [] }); $('log').textContent = 'Enter the PIN to see status.';
+  say('All data cleared.', 'good');
+};
 
 // show progress right after a reload (PIN comes back from this tab's session) and keep it fresh
 if ($('pin').value.length === 4) refresh(true);
