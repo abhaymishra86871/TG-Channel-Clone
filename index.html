@@ -82,10 +82,10 @@
       <textarea id="session" rows="3" autocomplete="off" spellcheck="false" placeholder="Paste a saved session, or generate one below"></textarea>
       <small class="hint">GramJS / Telethon string session. Account needs to be a member of the source and admin of the destination.</small>
       <div class="row">
-        <div><label for="apiId">API ID (optional)</label><input id="apiId" inputmode="numeric" autocomplete="off" placeholder="1234567"></div>
-        <div><label for="apiHash">API hash (optional)</label><input id="apiHash" type="password" autocomplete="off" placeholder="32 characters"></div>
+        <div><label for="apiId">API ID</label><input id="apiId" inputmode="numeric" autocomplete="off" placeholder="1234567"></div>
+        <div><label for="apiHash">API hash</label><input id="apiHash" type="password" autocomplete="off" placeholder="32 characters"></div>
       </div>
-      <small class="hint">Leave empty if API_ID / API_HASH are set on Render. Needed only to log in and generate a new session.</small>
+      <small class="hint">From my.telegram.org. Required in account mode, together with the session string.</small>
       <div class="btns" style="margin-top:8px"><button type="button" id="bGen" class="sec">Generate session (OTP)</button></div>
       <label class="ck"><input id="notifySaved" type="checkbox" checked> Show progress in my “Saved Messages”</label>
     </div>
@@ -142,7 +142,7 @@
   <div id="sPhone">
     <label for="sp">Phone number (with country code)</label>
     <input id="sp" placeholder="+919876543210" inputmode="tel" autocomplete="off">
-    <small class="hint">Uses the API ID / hash from the page (or the ones set on Render). Telegram sends a login code to your Telegram app.</small>
+    <small class="hint">Uses the API ID / hash entered on the page. Telegram sends a login code to your Telegram app.</small>
     <div class="btns"><button id="sSend">Send code</button><button class="sec" data-close>Cancel</button></div>
   </div>
   <div id="sCode" class="hide">
