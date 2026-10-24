@@ -11,16 +11,20 @@
   body{margin:0;background:var(--bg);color:var(--fg);font:16px/1.45 system-ui,sans-serif;padding:16px}
   main{max-width:560px;margin:0 auto}
   h1{font-size:1.3rem;margin:8px 0 16px}
+  h2{font-size:1.05rem;margin:0 0 8px}
   .card{background:var(--card);border:1px solid var(--bd);border-radius:12px;padding:16px;margin-bottom:16px}
   label{display:block;font-size:.85rem;color:var(--mut);margin:12px 0 4px}
-  label:first-child{margin-top:0}
-  input{width:100%;padding:10px;border:1px solid var(--bd);border-radius:8px;background:var(--bg);color:var(--fg);font:inherit}
+  input,textarea{width:100%;padding:10px;border:1px solid var(--bd);border-radius:8px;background:var(--bg);color:var(--fg);font:inherit}
+  textarea{font-size:.8rem;word-break:break-all}
   .row{display:grid;grid-template-columns:1fr 1fr;gap:12px}
   .btns{display:flex;gap:8px;flex-wrap:wrap;margin-top:16px}
   button{padding:10px 16px;border:0;border-radius:8px;font:inherit;font-weight:600;cursor:pointer;background:var(--acc);color:#fff}
   button.sec{background:transparent;color:var(--fg);border:1px solid var(--bd)}
   button.stop{background:var(--bad)}
   button:disabled{opacity:.5;cursor:wait}
+  .tabs{display:flex;gap:8px;margin-bottom:4px}
+  .tabs button{flex:1;background:transparent;color:var(--fg);border:1px solid var(--bd)}
+  .tabs button.on{background:var(--acc);color:#fff;border-color:var(--acc)}
   .pill{display:inline-block;padding:2px 10px;border-radius:99px;font-size:.8rem;font-weight:600;border:1px solid var(--bd)}
   .bar{height:10px;border-radius:99px;background:var(--bd);overflow:hidden;margin:12px 0 8px}
   .bar>div{height:100%;width:0;background:var(--acc);transition:width .4s}
@@ -28,8 +32,16 @@
   .stats b{display:block;font-size:1.1rem;color:var(--fg)}
   pre{margin:12px 0 0;max-height:220px;overflow:auto;font-size:.75rem;background:var(--bg);border:1px solid var(--bd);border-radius:8px;padding:10px;white-space:pre-wrap}
   #msg{min-height:1.4em;margin-top:12px;font-size:.9rem}
-  .err{color:var(--bad)}.good{color:var(--ok)}
-  small{color:var(--mut)}
+  .err{color:var(--bad)}.good{color:var(--ok)}.warn{color:var(--warn)}
+  small,.hint{color:var(--mut);font-size:.8rem}
+  .hint{display:block;margin-top:6px}
+  dialog{border:1px solid var(--bd);border-radius:14px;background:var(--card);color:var(--fg);padding:20px;width:min(92vw,460px)}
+  dialog::backdrop{background:rgba(0,0,0,.5)}
+  .chk{display:flex;gap:10px;padding:10px 0;border-top:1px solid var(--bd)}
+  .chk:first-of-type{border-top:0}
+  .chk .ic{font-size:1.2rem;line-height:1.2}
+  .chk b{display:block}
+  .hide{display:none}
 </style>
 </head>
 <body>
@@ -39,6 +51,29 @@
   <div class="card">
     <label for="api">Render URL</label>
     <input id="api" placeholder="https://your-bot.onrender.com" autocomplete="off">
+
+    <label>Copy using</label>
+    <div class="tabs">
+      <button type="button" id="tBot" class="on">Bot token</button>
+      <button type="button" id="tUser">My account (session)</button>
+    </div>
+
+    <div id="botBox">
+      <label for="token">Bot token</label>
+      <input id="token" type="password" autocomplete="off" placeholder="123456:ABC-DEF… (blank = token set in Render)">
+      <small class="hint">Bot must be admin in the source and in the destination channel.</small>
+    </div>
+
+    <div id="userBox" class="hide">
+      <div class="row">
+        <div><label for="apiId">API ID</label><input id="apiId" inputmode="numeric" autocomplete="off" placeholder="1234567"></div>
+        <div><label for="apiHash">API hash</label><input id="apiHash" type="password" autocomplete="off" placeholder="32 characters"></div>
+      </div>
+      <label for="session">Session string</label>
+      <textarea id="session" rows="3" autocomplete="off" spellcheck="false" placeholder="Paste a saved session, or press Generate session"></textarea>
+      <div class="btns" style="margin-top:8px"><button type="button" id="bGen" class="sec">Generate session (OTP)</button></div>
+      <small class="hint">Account only needs to be a member of the source and an admin of the destination. API ID/hash come from my.telegram.org.</small>
+    </div>
 
     <label for="src">Source channel ID</label>
     <input id="src" placeholder="-1001234567890" inputmode="numeric" autocomplete="off">
@@ -55,13 +90,13 @@
     <input id="pin" type="password" inputmode="numeric" maxlength="4" autocomplete="off" placeholder="4-digit PIN set in Render env">
 
     <div class="btns">
+      <button id="bCheck" class="sec">Check setup</button>
       <button id="bStart">Start</button>
       <button id="bResume" class="sec">Resume</button>
       <button id="bStop" class="stop">Stop</button>
-      <button id="bRefresh" class="sec">Refresh</button>
     </div>
     <div id="msg"></div>
-    <small>The first request can take ~1 minute if Render was asleep.</small>
+    <small>The first request can take ~1 minute if Render was asleep. Tokens and sessions are never saved in this page.</small>
   </div>
 
   <div class="card">
@@ -72,16 +107,64 @@
       <div><b id="sSkipped">–</b>skipped</div>
       <div><b id="sNext">–</b>next ID</div>
     </div>
-    <pre id="log">Enter PIN and press Refresh.</pre>
+    <pre id="log">Enter the PIN to see status.</pre>
   </div>
 </main>
 
+<!-- Check setup popup -->
+<dialog id="dCheck">
+  <h2>Setup check</h2>
+  <div id="checkBody"></div>
+  <div class="btns"><button id="checkClose">Close</button></div>
+</dialog>
+
+<!-- Session generator popup -->
+<dialog id="dSess">
+  <h2>Generate session</h2>
+  <div id="sPhone">
+    <label for="sp">Phone number (with country code)</label>
+    <input id="sp" placeholder="+919876543210" inputmode="tel" autocomplete="off">
+    <small class="hint">Uses the API ID / hash entered on the page. Telegram sends a login code to your Telegram app.</small>
+    <div class="btns"><button id="sSend">Send code</button><button class="sec" data-close>Cancel</button></div>
+  </div>
+  <div id="sCode" class="hide">
+    <label for="sc">Login code</label>
+    <input id="sc" inputmode="numeric" autocomplete="off" placeholder="12345">
+    <div class="btns"><button id="sVerify">Verify</button><button class="sec" data-close>Cancel</button></div>
+  </div>
+  <div id="sPass" class="hide">
+    <label for="sw">Two-step verification password</label>
+    <input id="sw" type="password" autocomplete="off">
+    <div class="btns"><button id="sPassGo">Submit</button><button class="sec" data-close>Cancel</button></div>
+  </div>
+  <div id="sDone" class="hide">
+    <p class="good"><b>Session created.</b> It was placed in the session box. Save a copy in a password manager.</p>
+    <small class="hint">Treat it like your account password: anyone with it can use your Telegram account. Revoke it anytime in Telegram → Settings → Devices.</small>
+    <div class="btns"><button id="sCopy" class="sec">Copy</button><button data-close>Done</button></div>
+  </div>
+  <div id="sMsg" class="err" style="margin-top:10px;min-height:1.3em"></div>
+</dialog>
+
 <script>
 const $ = (id) => document.getElementById(id);
-const SAVE = ['api', 'src', 'dst', 'from', 'to']; // PIN is never stored
+const SAVE = ['api', 'src', 'dst', 'from', 'to', 'apiId']; // secrets (token, hash, session, PIN) are never stored
+let mode = 'bot';
 
-try { SAVE.forEach((k) => { const v = localStorage.getItem('cc_' + k); if (v) $(k).value = v; }); } catch {}
-const persist = () => { try { SAVE.forEach((k) => localStorage.setItem('cc_' + k, $(k).value)); } catch {} };
+try {
+  SAVE.forEach((k) => { const v = localStorage.getItem('cc_' + k); if (v) $(k).value = v; });
+  if (localStorage.getItem('cc_mode') === 'user') setMode('user');
+} catch {}
+const persist = () => { try { SAVE.forEach((k) => localStorage.setItem('cc_' + k, $(k).value)); localStorage.setItem('cc_mode', mode); } catch {} };
+
+function setMode(m) {
+  mode = m;
+  $('tBot').classList.toggle('on', m === 'bot');
+  $('tUser').classList.toggle('on', m === 'user');
+  $('botBox').classList.toggle('hide', m !== 'bot');
+  $('userBox').classList.toggle('hide', m !== 'user');
+}
+$('tBot').onclick = () => setMode('bot');
+$('tUser').onclick = () => setMode('user');
 
 function say(text, cls) { const m = $('msg'); m.textContent = text; m.className = cls || ''; }
 
@@ -109,11 +192,19 @@ async function call(path, extra) {
   } finally { clearTimeout(t); }
 }
 
+// everything the server needs to run a job, per the selected mode
+function jobFields() {
+  const base = { mode, source: $('src').value.trim(), dest: $('dst').value.trim() };
+  if (mode === 'bot') return { ...base, token: $('token').value.trim() };
+  return { ...base, apiId: $('apiId').value.trim(), apiHash: $('apiHash').value.trim(), session: $('session').value.trim() };
+}
+
 function render(s) {
   const pill = $('status');
   pill.textContent = s.status + (s.running ? ' ●' : '');
   pill.style.color = { running: 'var(--acc)', done: 'var(--ok)', error: 'var(--bad)', stopped: 'var(--warn)' }[s.status] || '';
-  $('route').textContent = s.source ? `${s.source} → ${s.dest}  (${s.from}–${s.to})` : '';
+  const name = (t, id) => (t ? `${t}` : id);
+  $('route').textContent = s.source ? `${name(s.sourceTitle, s.source)} → ${name(s.destTitle, s.dest)} · ${s.mode === 'user' ? 'account ' : 'bot '}${s.accountName || ''}` : '';
   const total = s.to && s.from ? s.to - s.from + 1 : 0;
   const done = s.next && s.from ? Math.min(total, s.next - s.from) : 0;
   $('fill').style.width = total ? (100 * done / total).toFixed(1) + '%' : '0';
@@ -138,13 +229,57 @@ async function act(btn, path, extra, okText) {
   finally { btn.disabled = false; }
 }
 
-$('bStart').onclick = (e) => act(e.target, '/start', {
-  source: $('src').value.trim(), dest: $('dst').value.trim(),
-  from: $('from').value, to: $('to').value,
-}, 'Started.');
+$('bStart').onclick = (e) => act(e.target, '/start', { ...jobFields(), from: $('from').value, to: $('to').value }, 'Started.');
 $('bResume').onclick = (e) => act(e.target, '/resume', {}, 'Resumed.');
 $('bStop').onclick = (e) => act(e.target, '/stop', {}, 'Stop requested.');
-$('bRefresh').onclick = () => refresh(false);
+
+// ----- Check setup popup (all text via textContent: channel titles are untrusted) -----
+function row(ok, title, lines) {
+  const d = document.createElement('div'); d.className = 'chk';
+  const ic = document.createElement('span'); ic.className = 'ic'; ic.textContent = ok ? '✅' : '❌';
+  const b = document.createElement('div');
+  const t = document.createElement('b'); t.textContent = title; b.appendChild(t);
+  lines.filter(Boolean).forEach((l) => { const s = document.createElement('small'); s.style.display = 'block'; s.textContent = l; b.appendChild(s); });
+  d.append(ic, b); return d;
+}
+$('bCheck').onclick = async (e) => {
+  const btn = e.target; btn.disabled = true; say('Checking…');
+  try {
+    const r = await call('/check', jobFields());
+    const body = $('checkBody'); body.replaceChildren();
+    body.appendChild(row(true, (r.mode === 'user' ? 'Account: ' : 'Bot: ') + r.account.name, [r.account.username, 'ID ' + r.account.id]));
+    body.appendChild(row(r.source.ok, 'Source: ' + (r.source.title || r.source.id), [`Role: ${r.source.role || '—'}`, r.source.ok ? 'Can read from here' : r.source.note]));
+    body.appendChild(row(r.dest.ok, 'Destination: ' + (r.dest.title || r.dest.id), [`Role: ${r.dest.role || '—'}`, r.dest.ok ? 'Can post here' : r.dest.note]));
+    const sum = document.createElement('p'); sum.className = r.ok ? 'good' : 'err';
+    sum.textContent = r.ok ? 'All good. You can press Start.' : 'Fix the items marked ❌, then check again.';
+    body.appendChild(sum);
+    say(''); $('dCheck').showModal();
+  } catch (err) { say(err.message, 'err'); }
+  finally { btn.disabled = false; }
+};
+$('checkClose').onclick = () => $('dCheck').close();
+
+// ----- Session generator -----
+function sStep(id) { ['sPhone', 'sCode', 'sPass', 'sDone'].forEach((x) => $(x).classList.toggle('hide', x !== id)); }
+function sHandle(r) {
+  $('sMsg').textContent = '';
+  if (r.state === 'need_code') { sStep('sCode'); if (r.error) $('sMsg').textContent = r.error; $('sc').focus(); }
+  else if (r.state === 'need_password') { sStep('sPass'); if (r.error) $('sMsg').textContent = r.error; $('sw').focus(); }
+  else if (r.state === 'done') { $('session').value = r.session; $('sc').value = ''; $('sw').value = ''; sStep('sDone'); }
+  else if (r.state === 'error') { sStep('sPhone'); $('sMsg').textContent = r.error || 'Login failed'; }
+  else { $('sMsg').textContent = 'Telegram did not answer in time. Try again.'; sStep('sPhone'); }
+}
+async function sRun(btn, fn) {
+  btn.disabled = true; $('sMsg').textContent = 'Working…';
+  try { sHandle(await fn()); } catch (e) { $('sMsg').textContent = e.message; }
+  finally { btn.disabled = false; }
+}
+$('bGen').onclick = () => { sStep('sPhone'); $('sMsg').textContent = ''; $('dSess').showModal(); };
+$('sSend').onclick = (e) => sRun(e.target, () => call('/session/start', { apiId: $('apiId').value.trim(), apiHash: $('apiHash').value.trim(), phone: $('sp').value.trim() }));
+$('sVerify').onclick = (e) => sRun(e.target, () => call('/session/code', { code: $('sc').value }));
+$('sPassGo').onclick = (e) => sRun(e.target, () => call('/session/password', { password: $('sw').value }));
+$('sCopy').onclick = async () => { try { await navigator.clipboard.writeText($('session').value); $('sMsg').textContent = ''; $('sCopy').textContent = 'Copied'; } catch { $('session').select(); } };
+document.querySelectorAll('[data-close]').forEach((b) => b.onclick = () => { $('dSess').close(); call('/session/cancel', {}).catch(() => {}); $('sp').value = ''; });
 
 // auto-refresh every 5s while the tab is open and a PIN is typed
 setInterval(() => { if ($('pin').value && $('api').value && !document.hidden) refresh(true); }, 5000);
