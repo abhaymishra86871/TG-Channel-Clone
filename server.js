@@ -28,8 +28,6 @@ const UP_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN || '';
 const UP_KEY = process.env.UPSTASH_KEY || 'copybot:state';
 const TG_API = process.env.TG_API || 'https://api.telegram.org';
 const ENC_KEY = process.env.ENC_KEY || '';
-const ENV_API_ID = (process.env.API_ID || '').trim();     // optional defaults for account mode
-const ENV_API_HASH = (process.env.API_HASH || '').trim();
 
 if (!PIN || !ALLOWED_ORIGIN) {
   console.error('Missing env: PIN and ALLOWED_ORIGIN are required.');
@@ -559,8 +557,7 @@ function parseCreds(body) {
     return { mode, token };
   }
   if (!encKey) throw new Error('Set the ENC_KEY environment variable on Render first (needed to store the session safely).');
-  const apiId = String(body.apiId || ENV_API_ID || '').trim(), apiHash = String(body.apiHash || ENV_API_HASH || '').trim(), session = String(body.session || '').trim();
-  if (!apiId && !apiHash) throw new Error('API ID and hash are needed by the Telegram library. Enter them on the page, or set API_ID and API_HASH once on Render.');
+  const apiId = String(body.apiId || '').trim(), apiHash = String(body.apiHash || '').trim(), session = String(body.session || '').trim();
   if (!/^\d{3,12}$/.test(apiId)) throw new Error('API ID must be a number (from my.telegram.org)');
   if (!/^[0-9a-f]{32}$/i.test(apiHash)) throw new Error('API hash must be 32 hex characters (from my.telegram.org)');
   if (session.length < 20) throw new Error('Enter the session string (use "Generate session")');
@@ -603,7 +600,7 @@ async function waitPending(p, seq, ms = 45000) {
 
 async function sessionStart(body) {
   if (!encKey) throw new Error('Set the ENC_KEY environment variable on Render first (needed to store the session safely).');
-  const apiId = String(body.apiId || ENV_API_ID || '').trim(), apiHash = String(body.apiHash || ENV_API_HASH || '').trim(), phone =String(body.phone || '').replace(/[\s-]/g, '');
+  const apiId = String(body.apiId || '').trim(), apiHash = String(body.apiHash || '').trim(), phone =String(body.phone || '').replace(/[\s-]/g, '');
   if (!/^\d{3,12}$/.test(apiId)) throw new Error('API ID must be a number (from my.telegram.org)');
   if (!/^[0-9a-f]{32}$/i.test(apiHash)) throw new Error('API hash must be 32 hex characters');
   if (!/^\+\d{7,15}$/.test(phone)) throw new Error('Phone must include country code, e.g. +919876543210');
