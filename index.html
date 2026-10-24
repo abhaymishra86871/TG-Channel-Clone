@@ -117,7 +117,7 @@
       <button id="bStop" class="stop">Stop</button>
     </div>
     <div id="msg"></div>
-    <small>First request can take ~1 minute if Render was asleep. Tokens, sessions and hashes are never saved in this page.</small>
+    <small>First request can take ~1 minute if Render was asleep. Everything except the PIN is saved in this browser only (not on the server). Use “Clear all data” to wipe it.</small>
   </div>
 
   <div class="card">
@@ -171,7 +171,7 @@
 <script>
 const $ = (id) => document.getElementById(id);
 const DEFAULT_URL = 'https://tg-channel-clone.onrender.com';
-const SAVE = ['api', 'src', 'dst', 'from', 'to', 'apiId', 'delay', 'notifyId']; // non-secret only
+const SAVE = ['api', 'src', 'dst', 'from', 'to', 'apiId', 'apiHash', 'session', 'token', 'delay', 'notifyId']; // everything except the PIN
 let mode = 'bot';
 
 $('api').value = DEFAULT_URL;
@@ -188,6 +188,7 @@ const persist = () => {
     localStorage.setItem('cc_mode', mode);
   } catch {}
 };
+document.addEventListener('input', (e) => { if (e.target.id !== 'pin') persist(); }); // save as you type
 $('pin').addEventListener('input', () => { try { sessionStorage.setItem('cc_pin', $('pin').value); } catch {} if ($('pin').value.length === 4) refresh(false); });
 
 function setMode(m) {
