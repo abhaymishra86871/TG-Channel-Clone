@@ -53,7 +53,8 @@ Environment variables:
 | `UPSTASH_REDIS_REST_URL` | from Step 4 |
 | `UPSTASH_REDIS_REST_TOKEN` | from Step 4 |
 | `BOT_TOKEN` | optional default bot token (panel field can stay empty) |
-| `DELAY_MS` | optional, default `3000` ms between messages |
+| `API_ID`, `API_HASH` | optional, account mode: set once here so you never type them on the page |
+| `DELAY_MS` | optional default delay (ms); the page has its own "Delay (seconds)" field per run |
 
 Open `<render-url>/health` -> should say `ok`.
 
@@ -61,18 +62,28 @@ Open `<render-url>/health` -> should say `ok`.
 Add Monitor -> HTTP(s) -> `https://<render-url>/health` -> every 5 minutes. Keeps Render from sleeping.
 
 ## STEP 8 - Use the panel
-1. Enter Render URL, PIN, choose **Bot token** or **My account**.
-2. *Account mode first time:* enter API ID + API hash -> **Generate session (OTP)** -> phone number with country code -> code from your Telegram app -> 2-step password if you have one -> session is filled in. Save it in a password manager so you can reuse it.
-3. Enter source/destination IDs and start/end message IDs.
-4. **Check setup** -> popup shows the bot/account name and both channel names with admin status. Fix any red items.
-5. **Start**. Stop / Resume are on the same page. You can close the page; the job keeps running.
+1. Enter the **PIN** (top of the page). The server URL is prefilled. The PIN is remembered only until the tab closes, so a reload keeps showing live progress.
+2. Choose **Bot token** or **My account**.
+   - *Already have a session string?* Paste it. API ID/hash are optional if `API_ID`/`API_HASH` are set on Render (otherwise type them once; the library needs a valid pair).
+   - *No session yet:* **Generate session (OTP)** -> phone number with country code -> code from your Telegram app -> 2-step password if you have one -> the session is filled in. Save it in a password manager.
+3. Enter source/destination IDs, start/end message IDs and the delay in seconds.
+4. Progress messages (optional): bot mode -> your Telegram user ID (you must have pressed Start on the bot); account mode -> tick "Show progress in Saved Messages".
+5. **Check setup** -> popup shows the bot/account name, both channel names with admin status, and whether progress messages can be delivered. Fix any red items.
+6. **Start**. Stop / Resume are on the same page. You can close the page; the job keeps running.
 
 ## Behaviour
 - Progress saved after every message (local) and every 5 messages (Upstash). After a crash/restart a running job resumes automatically.
+- The page shows % done and the message ID it is currently at; it reads this from the server, so reloading the page never loses it.
+- Progress message: one message is **edited in place** about every 15 s (never a stream of new messages): in Saved Messages (account mode) or in the chat of the user ID you entered (bot mode). On Stop/error it shows the final state.
+- **On success nothing is left behind:** stored credentials, the state file and the Upstash key are deleted, and the progress message is deleted. (The page keeps showing "done" until the server next restarts.)
 - Flood limits (429 / FLOOD_WAIT): waits the time Telegram asks, retries the same message, then slows down a bit.
 - Network / 5xx errors: backoff 2 s..60 s, retried forever.
 - Deleted / non-copyable IDs are skipped and counted. Fatal problems (revoked session, no rights, restricted channel) stop the job with the error shown.
 - 5 wrong PINs -> locked 15 min (doubling each time, max 24 h). Other origins are rejected.
+
+## PIN vs ENC_KEY (two different jobs, keep both)
+- **PIN** = the door. Without it nobody can call the server (start, stop, status, login).
+- **ENC_KEY** = a lock on the stored data. The token/session is kept on Render's disk and in Upstash so a crashed job can resume; ENC_KEY encrypts it there, so someone who sees your Upstash dashboard or the disk can't read your session. It is never typed on the page, so it can't replace the PIN.
 
 ## Security notes
 - A session string = full access to that Telegram account. Revoke it any time: Telegram -> Settings -> Devices.
