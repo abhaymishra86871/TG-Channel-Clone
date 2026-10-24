@@ -28,6 +28,8 @@ const UP_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN || '';
 const UP_KEY = process.env.UPSTASH_KEY || 'copybot:state';
 const TG_API = process.env.TG_API || 'https://api.telegram.org';
 const ENC_KEY = process.env.ENC_KEY || '';
+const ENV_API_ID = (process.env.API_ID || '').trim();     // optional defaults for account mode
+const ENV_API_HASH = (process.env.API_HASH || '').trim();
 
 if (!PIN || !ALLOWED_ORIGIN) {
   console.error('Missing env: PIN and ALLOWED_ORIGIN are required.');
@@ -68,6 +70,7 @@ const sleep = async (ms) => {
   }
 };
 
+const nap = (ms) => new Promise((r) => setTimeout(r, ms)); // plain sleep, not interrupted by Stop
 const secrets = new Set(); // never let these reach the logs
 function addSecrets(c) {
   [c && c.token, c && c.session, c && c.apiHash].forEach((s) => { if (s && String(s).length > 8) secrets.add(String(s)); });
@@ -93,6 +96,7 @@ let state = {
   sourceTitle: null, destTitle: null, accountName: null,
   next: null, copied: 0, skipped: 0,
   lastError: null, startedAt: null, updatedAt: 0,
+  baseDelay: null, notifyUserId: null, notifySaved: false, progressMsgId: null,
   creds: null, // never sent to the browser
 };
 
@@ -112,6 +116,7 @@ function hydrate(o) {
 }
 
 function saveLocal() {
+  if (state.status === 'done') return; // a finished job leaves nothing on disk
   try {
     state.updatedAt = now();
     const tmp = STATE_FILE + '.tmp';
@@ -132,7 +137,7 @@ async function upstash(cmd) {
 
 let lastRemoteAt = 0, sinceRemote = 0;
 async function saveRemote() {
-  if (!UP_URL || !UP_TOKEN) return;
+  if (!UP_URL || !UP_TOKEN || state.status === 'done') return;
   lastRemoteAt = now(); sinceRemote = 0;
   try { await upstash(['SET', UP_KEY, serialize()]); }
   catch (e) { log('remote save failed: ' + e.message); }
@@ -167,6 +172,7 @@ async function loadState() {
 }
 
 // ---------- pacing ----------
+let baseDelay = BASE_DELAY; // per job, chosen on the panel
 let delay = BASE_DELAY, lastCallAt = 0, okStreak = 0, lastWasSkip = false;
 async function pace() {
   const need = (lastWasSkip ? Math.min(SKIP_DELAY, delay) : delay) - (now() - lastCallAt);
@@ -203,6 +209,26 @@ function botDriver(creds) {
       if (code === 400 && SKIP_RE.test(desc)) return { kind: 'skipped' };
       if (code === 401 || code === 403 || code === 404 || FATAL_RE.test(desc)) return { kind: 'fatal', msg: `${code} ${desc}` };
       return { kind: 'skipped', msg: `${code} ${desc}` }; // odd message: don't hang the whole job
+    },
+    // progress message to a Telegram user who has already pressed Start on the bot
+    async notify(text) {
+      const uid = state.notifyUserId;
+      if (!uid) return;
+      if (state.progressMsgId) {
+        const r = await call('editMessageText', { chat_id: uid, message_id: state.progressMsgId, text });
+        const d = r.description || '';
+        if (r.ok || /not modified/i.test(d)) return;
+        if (!/message to edit not found|can't be edited|message_id_invalid/i.test(d)) throw new Error(d);
+      }
+      const r = await call('sendMessage', { chat_id: uid, text, disable_notification: true });
+      if (!r.ok) throw new Error(r.description || 'sendMessage failed');
+      state.progressMsgId = r.result.message_id;
+    },
+    async clearNotify() {
+      const uid = state.notifyUserId;
+      if (!uid || !state.progressMsgId) return;
+      try { await call('deleteMessage', { chat_id: uid, message_id: state.progressMsgId }); } catch {}
+      state.progressMsgId = null;
     },
     async close() {},
   };
@@ -297,6 +323,25 @@ function userDriver(creds) {
         return ok ? { kind: 'copied' } : { kind: 'skipped' };
       } catch (e) { return mapUserError(e); }
     },
+    // progress message in the account's own "Saved Messages"
+    async notify(text) {
+      if (!state.notifySaved || !client) return;
+      if (state.progressMsgId) {
+        try { await client.editMessage('me', { message: state.progressMsgId, text }); return; }
+        catch (e) {
+          const m = errText(e);
+          if (/MESSAGE_NOT_MODIFIED/.test(m)) return;
+          if (!/MESSAGE_ID_INVALID|MESSAGE_NOT_FOUND|MESSAGE_EDIT_TIME_EXPIRED/.test(m)) throw e;
+        }
+      }
+      const msg = await client.sendMessage('me', { message: text, silent: true });
+      state.progressMsgId = msg.id;
+    },
+    async clearNotify() {
+      if (!state.progressMsgId || !client) return;
+      try { await client.deleteMessages('me', [state.progressMsgId], { revoke: true }); } catch {}
+      state.progressMsgId = null;
+    },
     async close() {
       const c = client; client = null;
       if (c) { try { await c.disconnect(); } catch {} try { if (c.destroy) await c.destroy(); } catch {} }
@@ -308,6 +353,46 @@ function userDriver(creds) {
 // ---------- copy loop ----------
 let driver = null;
 
+// ----- progress message (edited in place, never spammed) -----
+const withTimeout = (p, ms = 8000) => Promise.race([Promise.resolve(p), nap(ms)]);
+function progressText(extra) {
+  const total = state.to - state.from + 1;
+  const done = Math.max(0, Math.min(total, state.next - state.from));
+  const pct = total > 0 ? ((done / total) * 100).toFixed(1) : '0.0';
+  return [
+    '📋 Channel copy',
+    `${state.sourceTitle || state.source} → ${state.destTitle || state.dest}`,
+    `Now at message ${Math.min(state.next, state.to)}  (range ${state.from}–${state.to})`,
+    `Done: ${pct}%  ·  copied ${state.copied}, skipped ${state.skipped}`,
+    extra || 'Status: running',
+    `Updated ${new Date().toISOString().slice(11, 19)} UTC`,
+  ].join('\n');
+}
+let notifying = false, lastNotify = 0, lastNotifyErr = 0;
+function notify(force, extra) {
+  if (!driver || !driver.notify || notifying) return Promise.resolve();
+  if (!force && now() - lastNotify < 15000) return Promise.resolve();
+  lastNotify = now(); notifying = true;
+  const before = state.progressMsgId;
+  return Promise.resolve()
+    .then(() => driver.notify(progressText(extra)))
+    .then(() => { if (state.progressMsgId !== before) persist(true); })
+    .catch((e) => { if (now() - lastNotifyErr > 60000) { lastNotifyErr = now(); log('progress message failed: ' + errText(e)); } })
+    .finally(() => { notifying = false; });
+}
+async function notifyFinal(extra) { // wait for any in-flight update, then send the last one
+  for (let i = 0; i < 50 && notifying; i++) await nap(100);
+  await withTimeout(notify(true, extra));
+}
+
+// a successfully finished job leaves nothing behind: no credentials, no state file, no Redis key
+async function finishCleanup() {
+  state.creds = null; state.progressMsgId = null; state.notifyUserId = null; state.notifySaved = false;
+  secrets.clear();
+  try { fs.unlinkSync(STATE_FILE); } catch {}
+  if (UP_URL && UP_TOKEN) { try { await upstash(['DEL', UP_KEY]); } catch (e) { log('redis cleanup failed: ' + e.message); } }
+}
+
 async function copyOne(id) {
   let fails = 0;
   for (;;) {
@@ -317,7 +402,7 @@ async function copyOne(id) {
     const r = await driver.copy(id);
     if (r.kind === 'copied') {
       lastWasSkip = false;
-      if (++okStreak >= 100) { okStreak = 0; delay = Math.max(BASE_DELAY, Math.round(delay * 0.9)); }
+      if (++okStreak >= 100) { okStreak = 0; delay = Math.max(baseDelay, Math.round(delay * 0.9)); }
       return 'copied';
     }
     if (r.kind === 'skipped') {
@@ -330,6 +415,7 @@ async function copyOne(id) {
       delay = Math.min(MAX_DELAY, Math.round(delay * 1.3) + 200);
       log(`flood limit: waiting ${r.seconds + 1}s, then retrying id ${id} (delay now ${delay}ms)`);
       persist(true);
+      notify(true, `⏳ Telegram flood limit: waiting ${r.seconds + 1}s`);
       await sleep((r.seconds + 1) * 1000);
       continue;
     }
@@ -354,6 +440,7 @@ async function runJob() {
   try {
     if (!state.creds) throw new Fatal('No saved credentials. Start a new job.');
     addSecrets(state.creds);
+    baseDelay = state.baseDelay || BASE_DELAY; delay = baseDelay; okStreak = 0; lastWasSkip = false; lastNotify = 0;
     driver = state.creds.mode === 'user' ? userDriver(state.creds) : botDriver(state.creds);
     log(`job running (${state.creds.mode}): ${state.source} -> ${state.dest}, ids ${state.next}..${state.to}`);
     state.status = 'running'; state.lastError = null; persist(true);
@@ -375,6 +462,7 @@ async function runJob() {
       if (r === 'copied') state.copied++; else state.skipped++;
       state.next++;
       persist(false);
+      notify(false);
     }
     if (state.next > state.to) { state.status = 'done'; log(`done. copied=${state.copied} skipped=${state.skipped}`); }
   } catch (e) {
@@ -382,9 +470,15 @@ async function runJob() {
     log('STOPPED with error: ' + errText(e));
   } finally {
     running = false;
-    const d = driver; driver = null;
+    const d = driver;
+    try {
+      if (d && state.status === 'done') await withTimeout(d.clearNotify && d.clearNotify()); // delete the progress message
+      else if (d && state.status === 'stopped') await notifyFinal('⏹ Stopped. Press Resume on the page to continue.');
+      else if (d && state.status === 'error') await notifyFinal('❌ Stopped with error: ' + String(state.lastError).slice(0, 300));
+    } catch {}
+    driver = null;
     if (d) { try { await d.close(); } catch {} }
-    persist(true);
+    if (state.status === 'done') await finishCleanup(); else persist(true);
   }
 }
 
@@ -394,7 +488,7 @@ setInterval(() => {
 }, 30000).unref();
 
 // ---------- setup check ----------
-async function checkBot(token, source, dest) {
+async function checkBot(token, source, dest, notifyUserId) {
   const drv = botDriver({ token });
   const me = await drv.call('getMe');
   if (!me.ok) throw new Error('Bot token rejected by Telegram: ' + (me.description || 'invalid'));
@@ -417,7 +511,14 @@ async function checkBot(token, source, dest) {
     }
     return o;
   };
-  return { account, source: await one(source, false), dest: await one(dest, true) };
+  const out = { account, source: await one(source, false), dest: await one(dest, true) };
+  if (notifyUserId) {
+    const u = await drv.call('getChat', { chat_id: notifyUserId });
+    out.notify = u.ok
+      ? { ok: true, name: [u.result.first_name, u.result.last_name].filter(Boolean).join(' ') || String(notifyUserId), note: '' }
+      : { ok: false, name: String(notifyUserId), note: 'Bot cannot message this user. Open the bot in Telegram and press Start first (or check the ID).' };
+  }
+  return out;
 }
 
 async function checkUser(creds, source, dest) {
@@ -458,7 +559,8 @@ function parseCreds(body) {
     return { mode, token };
   }
   if (!encKey) throw new Error('Set the ENC_KEY environment variable on Render first (needed to store the session safely).');
-  const apiId = String(body.apiId || '').trim(), apiHash = String(body.apiHash || '').trim(), session = String(body.session || '').trim();
+  const apiId = String(body.apiId || ENV_API_ID || '').trim(), apiHash = String(body.apiHash || ENV_API_HASH || '').trim(), session = String(body.session || '').trim();
+  if (!apiId && !apiHash) throw new Error('API ID and hash are needed by the Telegram library. Enter them on the page, or set API_ID and API_HASH once on Render.');
   if (!/^\d{3,12}$/.test(apiId)) throw new Error('API ID must be a number (from my.telegram.org)');
   if (!/^[0-9a-f]{32}$/i.test(apiHash)) throw new Error('API hash must be 32 hex characters (from my.telegram.org)');
   if (session.length < 20) throw new Error('Enter the session string (use "Generate session")');
@@ -473,9 +575,14 @@ function parseIds(body) {
 async function runCheck(body) {
   const creds = parseCreds(body);
   const { source, dest } = parseIds(body);
+  const nid = String(body.notifyUserId || '').trim();
+  if (creds.mode === 'bot' && nid && !/^\d{5,}$/.test(nid)) throw new Error('Progress user ID must be a number (e.g. 123456789)');
   addSecrets(creds);
-  const r = creds.mode === 'bot' ? await checkBot(creds.token, source, dest) : await checkUser(creds, source, dest);
-  return { mode: creds.mode, ...r, ok: r.source.ok && r.dest.ok, creds };
+  const r = creds.mode === 'bot'
+    ? await checkBot(creds.token, source, dest, nid || null)
+    : await checkUser(creds, source, dest);
+  if (creds.mode === 'user' && body.notifySaved === true) r.notify = { ok: true, name: 'Saved Messages (your account)', note: '' };
+  return { mode: creds.mode, ...r, ok: r.source.ok && r.dest.ok && (!r.notify || r.notify.ok), creds };
 }
 
 // ---------- user-account login (OTP) ----------
@@ -496,7 +603,7 @@ async function waitPending(p, seq, ms = 45000) {
 
 async function sessionStart(body) {
   if (!encKey) throw new Error('Set the ENC_KEY environment variable on Render first (needed to store the session safely).');
-  const apiId = String(body.apiId || '').trim(), apiHash = String(body.apiHash || '').trim(), phone = String(body.phone || '').replace(/[\s-]/g, '');
+  const apiId = String(body.apiId || ENV_API_ID || '').trim(), apiHash = String(body.apiHash || ENV_API_HASH || '').trim(), phone =String(body.phone || '').replace(/[\s-]/g, '');
   if (!/^\d{3,12}$/.test(apiId)) throw new Error('API ID must be a number (from my.telegram.org)');
   if (!/^[0-9a-f]{32}$/i.test(apiHash)) throw new Error('API hash must be 32 hex characters');
   if (!/^\+\d{7,15}$/.test(phone)) throw new Error('Phone must include country code, e.g. +919876543210');
@@ -569,7 +676,7 @@ function readBody(req) {
 }
 const snapshot = () => {
   const { creds, ...rest } = state;
-  return { ...rest, running, delayMs: delay, encrypted: !!encKey, envBotToken: !!ENV_BOT_TOKEN, logs: logs.slice(-25) };
+  return { ...rest, running, delayMs: delay, encrypted: !!encKey, envBotToken: !!ENV_BOT_TOKEN, defaultDelaySec: BASE_DELAY / 1000, logs: logs.slice(-25) };
 };
 
 const server = http.createServer(async (req, res) => {
@@ -637,12 +744,18 @@ const server = http.createServer(async (req, res) => {
         const bad = [c.source.ok ? '' : 'Source: ' + c.source.note, c.dest.ok ? '' : 'Destination: ' + c.dest.note].filter(Boolean).join(' | ');
         return send(res, 400, { error: 'Setup check failed. ' + bad }, origin);
       }
+      const secs = body.delaySec === '' || body.delaySec == null ? NaN : Number(body.delaySec);
+      const baseMs = Number.isFinite(secs) ? Math.min(60000, Math.max(500, Math.round(secs * 1000))) : BASE_DELAY;
+      const nid = String(body.notifyUserId || '').trim();
       state = {
+        baseDelay: baseMs,
+        notifyUserId: c.mode === 'bot' && nid ? nid : null,
+        notifySaved: c.mode === 'user' && body.notifySaved === true,
+        progressMsgId: null,
         status: 'running', mode: c.mode, source: String(body.source).trim(), dest: String(body.dest).trim(), from, to,
         sourceTitle: c.source.title, destTitle: c.dest.title, accountName: c.account.name,
         next: from, copied: 0, skipped: 0, lastError: null, startedAt: now(), updatedAt: now(), creds: c.creds,
       };
-      delay = BASE_DELAY; okStreak = 0; lastWasSkip = false;
       persist(true);
       runJob();
       return send(res, 200, { ok: true }, origin);
