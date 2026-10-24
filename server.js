@@ -94,6 +94,7 @@ let state = {
   sourceTitle: null, destTitle: null, accountName: null,
   next: null, copied: 0, skipped: 0,
   lastError: null, startedAt: null, updatedAt: 0,
+  srcOpt: null, dstOpt: null, // {group, forum, topic}
   baseDelay: null, notifyUserId: null, notifySaved: false, progressMsgId: null,
   creds: null, // never sent to the browser
 };
@@ -173,14 +174,14 @@ async function loadState() {
 let baseDelay = BASE_DELAY; // per job, chosen on the panel
 let delay = BASE_DELAY, lastCallAt = 0, okStreak = 0, lastWasSkip = false;
 async function pace() {
-  const need = (lastWasSkip ? Math.min(SKIP_DELAY, delay) : delay) - (now() - lastCallAt);
+  const need = (lastWasSkip ? Math.min(driver && driver.mode === 'user' ? 1000 : SKIP_DELAY, delay) : delay) - (now() - lastCallAt);
   if (need > 0) await sleep(need);
   lastCallAt = now();
 }
 
 // ---------- driver: Bot API ----------
 const SKIP_RE = /message to copy not found|message can't be copied|message_id_invalid|message not found/i;
-const FATAL_RE = /chat not found|not enough rights|forbidden|kicked|need administrator|write_forbidden|bot was blocked|peer_id_invalid|have no rights|bot is not a member|chat_admin_required|channel_private/i;
+const FATAL_RE = /chat not found|not enough rights|forbidden|kicked|need administrator|write_forbidden|bot was blocked|peer_id_invalid|have no rights|bot is not a member|chat_admin_required|channel_private|thread not found|topic_closed|topic_deleted|topic_id_invalid/i;
 
 function botDriver(creds) {
   const call = async (method, params) => {
@@ -198,7 +199,9 @@ function botDriver(creds) {
     async init() {},
     async copy(id) {
       let res;
-      try { res = await call('copyMessage', { chat_id: state.dest, from_chat_id: state.source, message_id: id }); }
+      const params = { chat_id: state.dest, from_chat_id: state.source, message_id: id };
+      if (state.dstOpt && state.dstOpt.topic) params.message_thread_id = state.dstOpt.topic; // send into a forum topic
+      try { res = await call('copyMessage', params); }
       catch (e) { return { kind: 'transient', msg: e.message }; }
       if (res.ok) return { kind: 'copied' };
       const code = res.error_code, desc = res.description || '';
@@ -266,19 +269,37 @@ async function findDialogs(client, ids) {
 
 async function userRole(client, chat) {
   const g = gram();
+  const ent = chat.entity || {};
+  const isGroup = ent.className === 'Chat' || !!ent.megagroup;
+  const bannedSend = !!(ent.defaultBannedRights && ent.defaultBannedRights.sendMessages);
+  if (ent.className === 'Chat') { // basic group: no channel-participant API
+    const role = ent.creator ? 'creator' : (ent.adminRights ? 'admin' : 'member');
+    return { role, canPost: role !== 'member' || !bannedSend };
+  }
   try {
     const r = await client.invoke(new g.Api.channels.GetParticipant({ channel: chat.input, participant: new g.Api.InputPeerSelf() }));
     const p = r.participant, cls = p && p.className;
     if (cls === 'ChannelParticipantCreator') return { role: 'creator', canPost: true };
     if (cls === 'ChannelParticipantAdmin') {
       const rights = p.adminRights || {};
-      return { role: 'admin', canPost: !!rights.postMessages || !!(chat.entity && chat.entity.megagroup) };
+      return { role: 'admin', canPost: !!rights.postMessages || !!ent.megagroup };
     }
-    return { role: 'member', canPost: false };
+    if (cls === 'ChannelParticipantBanned') { // restricted member
+      const br = p.bannedRights || {};
+      return { role: p.left ? 'none' : 'restricted', canPost: !p.left && !br.sendMessages };
+    }
+    return { role: 'member', canPost: isGroup && !bannedSend };
   } catch (e) {
     if (/USER_NOT_PARTICIPANT/.test(errText(e))) return { role: 'none', canPost: false };
     throw e;
   }
+}
+
+// topic a message belongs to in a forum group (1 = General)
+function topicOfMsg(m) {
+  const rt = m && m.replyTo;
+  if (rt && rt.forumTopic) return Number(rt.replyToTopId || rt.replyToMsgId) || 1;
+  return 1;
 }
 
 function mapUserError(e) {
@@ -287,7 +308,7 @@ function mapUserError(e) {
     return { kind: 'flood', seconds: Number(e && e.seconds) || Number((m.match(/(\d+)/) || [])[1]) || 60 };
   }
   if (/MESSAGE_ID_INVALID|MESSAGE_ID_REQUIRED|MSG_ID_INVALID/.test(m)) return { kind: 'skipped' };
-  if (/CHAT_FORWARDS_RESTRICTED|CHAT_ADMIN_REQUIRED|CHAT_WRITE_FORBIDDEN|USER_BANNED_IN_CHANNEL|CHANNEL_PRIVATE|CHANNEL_INVALID|PEER_ID_INVALID|AUTH_KEY|SESSION_REVOKED|SESSION_EXPIRED|USER_DEACTIVATED|CHAT_SEND_.*FORBIDDEN/.test(m)) {
+  if (/CHAT_FORWARDS_RESTRICTED|CHAT_ADMIN_REQUIRED|CHAT_WRITE_FORBIDDEN|USER_BANNED_IN_CHANNEL|CHANNEL_PRIVATE|CHANNEL_INVALID|PEER_ID_INVALID|AUTH_KEY|SESSION_REVOKED|SESSION_EXPIRED|USER_DEACTIVATED|TOPIC_[A-Z_]+|CHAT_SEND_.*FORBIDDEN/.test(m)) {
     return { kind: 'fatal', msg: m };
   }
   if (e && e.errorMessage) return { kind: 'skipped', msg: m }; // unknown RPC error on one message
@@ -296,6 +317,7 @@ function mapUserError(e) {
 
 function userDriver(creds) {
   let client = null, src = null, dst = null;
+  const topicCache = new Map(); // id -> topic (0 = deleted), filled 100 ids at a time
   const self = {
     mode: 'user',
     session: creds.session,
@@ -303,19 +325,38 @@ function userDriver(creds) {
     async init() {
       if (client) await self.close();
       client = await connectUser(creds);
+      topicCache.clear();
       const f = await findDialogs(client, [state.source, state.dest]);
       if (!f[state.source]) throw new Fatal('Source channel not found in this account (join it first).');
       if (!f[state.dest]) throw new Fatal('Destination channel not found in this account.');
       src = f[state.source].input; dst = f[state.dest].input;
     },
+    // true = skip this id without any pause (deleted, or belongs to another topic than the one wanted)
+    async preSkip(id) {
+      const want = state.srcOpt && state.srcOpt.topic;
+      if (!want || !client) return false;
+      if (!topicCache.has(id)) {
+        const ids = [];
+        for (let i = id; i <= Math.min(state.to, id + 99); i++) ids.push(i);
+        const msgs = await client.getMessages(src, { ids });
+        // match results by message id (not by list position): deleted ids may be missing or shifted
+        const byId = new Map();
+        for (const m of msgs || []) if (m && m.className !== 'MessageEmpty' && m.id != null) byId.set(Number(m.id), m);
+        ids.forEach((x) => { const m = byId.get(x); topicCache.set(x, m ? topicOfMsg(m) : 0); });
+      }
+      const t = topicCache.get(id); topicCache.delete(id);
+      return t !== want;
+    },
     async copy(id) {
       const g = gram();
       try {
-        const res = await client.invoke(new g.Api.messages.ForwardMessages({
+        const fwd = {
           fromPeer: src, toPeer: dst, id: [id],
           randomId: [g.Helpers.generateRandomBigInt()],
           dropAuthor: true, // no "Forwarded from" header
-        }));
+        };
+        if (state.dstOpt && state.dstOpt.topic) fwd.topMsgId = state.dstOpt.topic; // into a forum topic
+        const res = await client.invoke(new g.Api.messages.ForwardMessages(fwd));
         const ups = (res && res.updates) || [];
         const ok = ups.some((u) => u && ['UpdateMessageID', 'UpdateNewChannelMessage', 'UpdateNewMessage'].includes(u.className));
         return ok ? { kind: 'copied' } : { kind: 'skipped' };
@@ -393,6 +434,21 @@ async function finishCleanup() {
 
 async function copyOne(id) {
   let fails = 0;
+  if (stopRequested || shuttingDown) return 'stopped';
+  if (driver.preSkip) {
+    // topic filter: if the lookup fails we must NOT copy blindly (it could be another topic's message), so retry
+    for (let t = 0; ; t++) {
+      try { if (await driver.preSkip(id)) return 'skipped'; break; }
+      catch (e) {
+        const m = mapUserError(e);
+        if (m.kind === 'fatal') throw new Fatal(m.msg);
+        const w = m.kind === 'flood' ? (m.seconds + 1) * 1000 : Math.min(60000, 2000 * 2 ** Math.min(t + 1, 5));
+        log(`topic lookup failed (${errText(e)}); retry in ${Math.round(w / 1000)}s`);
+        await sleep(w);
+        if (stopRequested || shuttingDown) return 'stopped';
+      }
+    }
+  }
   for (;;) {
     if (stopRequested || shuttingDown) return 'stopped';
     await pace();
@@ -486,30 +542,39 @@ setInterval(() => {
 }, 30000).unref();
 
 // ---------- setup check ----------
-async function checkBot(token, source, dest, notifyUserId) {
+async function checkBot(token, source, dest, notifyUserId, srcOpt, dstOpt) {
   const drv = botDriver({ token });
   const me = await drv.call('getMe');
   if (!me.ok) throw new Error('Bot token rejected by Telegram: ' + (me.description || 'invalid'));
   const account = { name: me.result.first_name, username: me.result.username ? '@' + me.result.username : '', id: me.result.id };
-  const one = async (id, needPost) => {
-    const o = { id, title: null, ok: false, role: null, note: '' };
+  const one = async (id, needPost, opt) => {
+    const o = { id, title: null, ok: false, role: null, kind: null, forum: false, note: '' };
     const c = await drv.call('getChat', { chat_id: id });
     if (!c.ok) { o.note = c.description || 'cannot access'; return o; }
     o.title = c.result.title || String(id);
+    const isGroup = c.result.type !== 'channel';
+    o.kind = isGroup ? 'group' : 'channel'; o.forum = !!c.result.is_forum;
+    if (opt.group !== isGroup) { o.note = isGroup ? 'This is a group, not a channel. Tick "is a group".' : 'This is a channel, not a group. Untick "is a group".'; return o; }
+    if (opt.forum && !o.forum) { o.note = 'Topics are not enabled in this group.'; return o; }
     const m = await drv.call('getChatMember', { chat_id: id, user_id: me.result.id });
     if (!m.ok) { o.note = m.description || 'cannot read membership'; return o; }
     const st = m.result.status; o.role = st;
     if (needPost) {
-      if (st === 'creator') o.ok = true;
+      if (isGroup) {
+        const canSendDefault = !(c.result.permissions && c.result.permissions.can_send_messages === false);
+        o.ok = st === 'creator' || st === 'administrator' || (st === 'member' && canSendDefault) || (st === 'restricted' && m.result.can_send_messages === true);
+        if (!o.ok) o.note = 'Bot cannot post in this group (not a member, or muted).';
+      } else if (st === 'creator') o.ok = true;
       else if (st === 'administrator') { o.ok = m.result.can_post_messages !== false; if (!o.ok) o.note = 'Admin, but "Post messages" is off'; }
       else o.note = 'Bot must be ADMIN here';
+      if (o.ok && o.forum && !opt.topic) o.note = 'Topics are on: messages will go to the General topic.';
     } else {
       o.ok = ['creator', 'administrator', 'member'].includes(st);
-      if (!o.ok) o.note = 'Bot is not in this channel (add it as admin)';
+      if (!o.ok) o.note = isGroup ? 'Bot is not in this group (add it)' : 'Bot is not in this channel (add it as admin)';
     }
     return o;
   };
-  const out = { account, source: await one(source, false), dest: await one(dest, true) };
+  const out = { account, source: await one(source, false, srcOpt), dest: await one(dest, true, dstOpt) };
   if (notifyUserId) {
     const u = await drv.call('getChat', { chat_id: notifyUserId });
     out.notify = u.ok
@@ -519,7 +584,7 @@ async function checkBot(token, source, dest, notifyUserId) {
   return out;
 }
 
-async function checkUser(creds, source, dest) {
+async function checkUser(creds, source, dest, srcOpt, dstOpt) {
   // reuse the running job's connection if it is the same session (avoid two connections)
   const reuse = driver && driver.mode === 'user' && driver.session === creds.session && driver.client;
   const client = reuse ? driver.client : await connectUser(creds);
@@ -530,25 +595,35 @@ async function checkUser(creds, source, dest) {
       username: me.username ? '@' + me.username : '', id: String(me.id),
     };
     const f = await findDialogs(client, [source, dest]);
-    const one = async (id, needPost) => {
-      const o = { id, title: null, ok: false, role: null, note: '' };
+    const one = async (id, needPost, opt) => {
+      const o = { id, title: null, ok: false, role: null, kind: null, forum: false, note: '' };
       const chat = f[id];
-      if (!chat) { o.note = 'This account has not joined this channel (or the ID is wrong)'; return o; }
+      if (!chat) { o.note = 'This account has not joined this chat (or the ID is wrong)'; return o; }
       o.title = chat.title;
+      const ent = chat.entity || {};
+      if (ent.className) {
+        const isGroup = ent.className === 'Chat' || !!ent.megagroup;
+        o.kind = isGroup ? 'group' : 'channel'; o.forum = !!ent.forum;
+        if (opt.group !== isGroup) { o.note = isGroup ? 'This is a group, not a channel. Tick "is a group".' : 'This is a channel, not a group. Untick "is a group".'; return o; }
+        if (opt.forum && !o.forum) { o.note = 'Topics are not enabled in this group.'; return o; }
+      }
       const r = await userRole(client, chat);
       o.role = r.role;
-      if (needPost) { o.ok = r.canPost; if (!o.ok) o.note = r.role === 'admin' ? 'Admin, but "Post messages" is off' : 'Account must be ADMIN here'; }
-      else o.ok = r.role !== 'none';
-      if (!o.ok && !o.note) o.note = 'Account is not in this channel';
+      if (needPost) {
+        o.ok = r.canPost;
+        if (!o.ok) o.note = r.role === 'admin' ? 'Admin, but "Post messages" is off' : (o.kind === 'group' ? 'Account cannot post in this group' : 'Account must be ADMIN here');
+        else if (o.forum && !opt.topic) o.note = 'Topics are on: messages will go to the General topic.';
+      } else o.ok = r.role !== 'none';
+      if (!o.ok && !o.note) o.note = 'Account is not in this chat';
       return o;
     };
-    return { account, source: await one(source, false), dest: await one(dest, true) };
+    return { account, source: await one(source, false, srcOpt), dest: await one(dest, true, dstOpt) };
   } finally {
     if (!reuse) { try { await client.disconnect(); } catch {} try { if (client.destroy) await client.destroy(); } catch {} }
   }
 }
 
-const ID_RE = /^-\d{6,}$/;
+const ID_RE = /^-\d{5,}$/;
 function parseCreds(body) {
   const mode = body.mode === 'user' ? 'user' : 'bot';
   if (mode === 'bot') {
@@ -565,21 +640,37 @@ function parseCreds(body) {
 }
 function parseIds(body) {
   const source = String(body.source || '').trim(), dest = String(body.dest || '').trim();
-  if (!ID_RE.test(source) || !ID_RE.test(dest)) throw new Error('Channel IDs must look like -1001234567890');
+  if (!ID_RE.test(source) || !ID_RE.test(dest)) throw new Error('Chat IDs must look like -1001234567890');
   if (source === dest) throw new Error('Source and destination are the same');
-  return { source, dest };
+  const side = (p, label) => {
+    const group = !!body[p + 'Group'];
+    const forum = group && !!body[p + 'Forum'];
+    const raw = String(body[p + 'Topic'] || '').trim();
+    let topic = null;
+    if (forum && raw) {
+      if (!/^\d{1,10}$/.test(raw) || Number(raw) < 1) throw new Error(label + ' topic ID must be a positive number');
+      topic = Number(raw);
+    }
+    return { group, forum, topic };
+  };
+  const src = side('src', 'Source'), dst = side('dst', 'Destination');
+  if (dst.topic === 1) dst.topic = null; // topic 1 is "General": send without a thread id
+  return { source, dest, src, dst };
 }
+// Telegram limits as given: bot -> group 20/min (3 s), bot -> channel/chat 1/s, account 1/s
+const minDelayMs = (mode, dstGroup) => (mode === 'user' ? 1000 : dstGroup ? 3000 : 1000);
 async function runCheck(body) {
   const creds = parseCreds(body);
-  const { source, dest } = parseIds(body);
+  const { source, dest, src, dst } = parseIds(body);
+  if (creds.mode === 'bot' && src.topic) throw new Error('Bot mode cannot filter by source topic (it copies every topic in the ID range). Clear the source topic ID or use account mode.');
   const nid = String(body.notifyUserId || '').trim();
   if (creds.mode === 'bot' && nid && !/^\d{5,}$/.test(nid)) throw new Error('Progress user ID must be a number (e.g. 123456789)');
   addSecrets(creds);
   const r = creds.mode === 'bot'
-    ? await checkBot(creds.token, source, dest, nid || null)
-    : await checkUser(creds, source, dest);
+    ? await checkBot(creds.token, source, dest, nid || null, src, dst)
+    : await checkUser(creds, source, dest, src, dst);
   if (creds.mode === 'user' && body.notifySaved === true) r.notify = { ok: true, name: 'Saved Messages (your account)', note: '' };
-  return { mode: creds.mode, ...r, ok: r.source.ok && r.dest.ok && (!r.notify || r.notify.ok), creds };
+  return { mode: creds.mode, ...r, opts: { src, dst }, ok: r.source.ok && r.dest.ok && (!r.notify || r.notify.ok), creds };
 }
 
 // ---------- user-account login (OTP) ----------
@@ -742,10 +833,11 @@ const server = http.createServer(async (req, res) => {
         return send(res, 400, { error: 'Setup check failed. ' + bad }, origin);
       }
       const secs = body.delaySec === '' || body.delaySec == null ? NaN : Number(body.delaySec);
-      const baseMs = Number.isFinite(secs) ? Math.min(60000, Math.max(500, Math.round(secs * 1000))) : BASE_DELAY;
+      const floorMs = minDelayMs(c.mode, c.opts.dst.group); // never faster than the Telegram limit
+      const baseMs = Math.min(60000, Math.max(floorMs, Number.isFinite(secs) ? Math.round(secs * 1000) : BASE_DELAY));
       const nid = String(body.notifyUserId || '').trim();
       state = {
-        baseDelay: baseMs,
+        baseDelay: baseMs, srcOpt: c.opts.src, dstOpt: c.opts.dst,
         notifyUserId: c.mode === 'bot' && nid ? nid : null,
         notifySaved: c.mode === 'user' && body.notifySaved === true,
         progressMsgId: null,
@@ -755,7 +847,7 @@ const server = http.createServer(async (req, res) => {
       };
       persist(true);
       runJob();
-      return send(res, 200, { ok: true }, origin);
+      return send(res, 200, { ok: true, delayMs: baseMs }, origin);
     }
 
     return send(res, 404, { error: 'Not found' }, origin);
