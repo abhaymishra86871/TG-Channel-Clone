@@ -1,37 +1,60 @@
 'use strict';
 /**
  * Telegram channel -> channel copier.
- * - Zero dependencies (Node 18+).
- * - Controlled over HTTP from a GitHub Pages panel (CORS-locked + PIN).
- * - Crash-safe: progress saved after every message (local file) and
- *   every few messages to Upstash Redis (optional, survives Render restarts).
- * - Respects Telegram limits: paced requests, honours retry_after on 429.
+ *  - Two modes, chosen per run from the control panel:
+ *      bot  : Bot API token  (bot must be admin in source AND destination)
+ *      user : your own account session (admin only needed in destination)
+ *  - Controlled over HTTP from a GitHub Pages panel (CORS-locked + 4-digit PIN).
+ *  - Crash-safe: progress saved after every message (local file) and every few
+ *    messages to Upstash Redis (optional). Credentials are encrypted at rest with ENC_KEY.
+ *  - Respects Telegram limits: paced requests, honours flood-wait / retry_after.
+ * The user mode needs the `telegram` (GramJS) package; bot mode needs no dependency.
  */
 const http = require('http');
 const fs = require('fs');
 const crypto = require('crypto');
 
 // ---------- config ----------
-const BOT_TOKEN = process.env.BOT_TOKEN;
+const ENV_BOT_TOKEN = process.env.BOT_TOKEN || ''; // optional default for bot mode
 const PIN = process.env.PIN;
 const ALLOWED_ORIGIN = (process.env.ALLOWED_ORIGIN || '').replace(/\/+$/, '');
 const PORT = Number(process.env.PORT) || 3000;
-const BASE_DELAY = Math.max(500, Number(process.env.DELAY_MS) || 3000); // ms between copies
+const BASE_DELAY = Math.max(500, Number(process.env.DELAY_MS) || 3000);
 const MAX_DELAY = 15000;
-const SKIP_DELAY = 400; // missing/deleted ids are cheap, go faster
+const SKIP_DELAY = 400;
 const STATE_FILE = process.env.STATE_FILE || './state.json';
 const UP_URL = (process.env.UPSTASH_REDIS_REST_URL || '').replace(/\/+$/, '');
 const UP_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN || '';
 const UP_KEY = process.env.UPSTASH_KEY || 'copybot:state';
 const TG_API = process.env.TG_API || 'https://api.telegram.org';
+const ENC_KEY = process.env.ENC_KEY || '';
 
-if (!BOT_TOKEN || !PIN || !ALLOWED_ORIGIN) {
-  console.error('Missing env: BOT_TOKEN, PIN and ALLOWED_ORIGIN are all required.');
+if (!PIN || !ALLOWED_ORIGIN) {
+  console.error('Missing env: PIN and ALLOWED_ORIGIN are required.');
   process.exit(1);
 }
 if (!/^\d{4}$/.test(PIN)) {
   console.error('PIN must be exactly 4 digits (e.g. 4827).');
   process.exit(1);
+}
+if (ENC_KEY && ENC_KEY.length < 12) {
+  console.error('ENC_KEY must be at least 12 characters (use a long random string).');
+  process.exit(1);
+}
+const encKey = ENC_KEY ? crypto.scryptSync(ENC_KEY, 'tgcopier-v1', 32) : null;
+
+// ---------- encryption of stored credentials ----------
+function enc(obj) {
+  const iv = crypto.randomBytes(12);
+  const c = crypto.createCipheriv('aes-256-gcm', encKey, iv);
+  const ct = Buffer.concat([c.update(JSON.stringify(obj), 'utf8'), c.final()]);
+  return Buffer.concat([iv, c.getAuthTag(), ct]).toString('base64');
+}
+function dec(s) {
+  const b = Buffer.from(s, 'base64');
+  const d = crypto.createDecipheriv('aes-256-gcm', encKey, b.subarray(0, 12));
+  d.setAuthTag(b.subarray(12, 28));
+  return JSON.parse(Buffer.concat([d.update(b.subarray(28)), d.final()]).toString('utf8'));
 }
 
 // ---------- tiny helpers ----------
@@ -45,29 +68,54 @@ const sleep = async (ms) => {
   }
 };
 
+const secrets = new Set(); // never let these reach the logs
+function addSecrets(c) {
+  [c && c.token, c && c.session, c && c.apiHash].forEach((s) => { if (s && String(s).length > 8) secrets.add(String(s)); });
+}
 const logs = [];
 function log(msg) {
-  const line = `${new Date().toISOString().slice(11, 19)} ${msg}`;
+  let m = String(msg);
+  for (const s of secrets) m = m.split(s).join('***');
+  const line = `${new Date().toISOString().slice(11, 19)} ${m}`;
   console.log(line);
   logs.push(line);
   if (logs.length > 60) logs.shift();
 }
 
 class Fatal extends Error {}
+const errText = (e) => String((e && (e.errorMessage || e.message)) || e);
 
 // ---------- state + persistence ----------
 let state = {
   status: 'idle', // idle | running | stopped | done | error
+  mode: null, // bot | user
   source: null, dest: null, from: null, to: null,
+  sourceTitle: null, destTitle: null, accountName: null,
   next: null, copied: 0, skipped: 0,
   lastError: null, startedAt: null, updatedAt: 0,
+  creds: null, // never sent to the browser
 };
+
+function serialize() {
+  const { creds, ...rest } = state;
+  const out = { ...rest };
+  if (creds) { if (encKey) out.credsEnc = enc(creds); else out.creds = creds; }
+  return JSON.stringify(out);
+}
+function hydrate(o) {
+  if (o.credsEnc) {
+    if (!encKey) throw new Error('state has encrypted credentials but ENC_KEY is not set');
+    o.creds = dec(o.credsEnc);
+    delete o.credsEnc;
+  }
+  return o;
+}
 
 function saveLocal() {
   try {
     state.updatedAt = now();
     const tmp = STATE_FILE + '.tmp';
-    fs.writeFileSync(tmp, JSON.stringify(state));
+    fs.writeFileSync(tmp, serialize(), { mode: 0o600 });
     fs.renameSync(tmp, STATE_FILE); // atomic: never a half-written file
   } catch (e) { log('local save failed: ' + e.message); }
 }
@@ -86,7 +134,7 @@ let lastRemoteAt = 0, sinceRemote = 0;
 async function saveRemote() {
   if (!UP_URL || !UP_TOKEN) return;
   lastRemoteAt = now(); sinceRemote = 0;
-  try { await upstash(['SET', UP_KEY, JSON.stringify(state)]); }
+  try { await upstash(['SET', UP_KEY, serialize()]); }
   catch (e) { log('remote save failed: ' + e.message); }
 }
 
@@ -97,30 +145,28 @@ function persist(force) {
 }
 
 async function loadState() {
-  let local = null, remote = null;
-  try { local = JSON.parse(fs.readFileSync(STATE_FILE, 'utf8')); } catch {}
+  const cands = [];
+  try { cands.push(JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'))); } catch {}
   if (UP_URL && UP_TOKEN) {
     try {
       const r = await upstash(['GET', UP_KEY]);
-      if (r && r.result) remote = JSON.parse(r.result);
+      if (r && r.result) cands.push(JSON.parse(r.result));
     } catch (e) { log('remote load failed: ' + e.message); }
   }
-  const best = [local, remote].filter(Boolean).sort((a, b) => b.updatedAt - a.updatedAt)[0];
-  if (best) { state = { ...state, ...best }; log(`state loaded: ${state.status}, next=${state.next}`); }
+  cands.sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+  const best = cands[0];
+  if (!best) return;
+  try { state = { ...state, ...hydrate(best) }; }
+  catch (e) {
+    delete best.credsEnc; state = { ...state, ...best, creds: null };
+    state.status = 'error';
+    state.lastError = 'Saved credentials cannot be decrypted (ENC_KEY changed?). Start a new job.';
+  }
+  addSecrets(state.creds);
+  log(`state loaded: ${state.status}, next=${state.next}`);
 }
 
-// ---------- Telegram ----------
-async function tg(method, params) {
-  const r = await fetch(`${TG_API}/bot${BOT_TOKEN}/${method}`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(params || {}),
-    signal: AbortSignal.timeout(30000),
-  });
-  return r.json(); // Telegram always replies JSON, even on errors
-}
-
-// pacing + adaptive slow-down
+// ---------- pacing ----------
 let delay = BASE_DELAY, lastCallAt = 0, okStreak = 0, lastWasSkip = false;
 async function pace() {
   const need = (lastWasSkip ? Math.min(SKIP_DELAY, delay) : delay) - (now() - lastCallAt);
@@ -128,8 +174,139 @@ async function pace() {
   lastCallAt = now();
 }
 
+// ---------- driver: Bot API ----------
 const SKIP_RE = /message to copy not found|message can't be copied|message_id_invalid|message not found/i;
 const FATAL_RE = /chat not found|not enough rights|forbidden|kicked|need administrator|write_forbidden|bot was blocked|peer_id_invalid|have no rights|bot is not a member|chat_admin_required|channel_private/i;
+
+function botDriver(creds) {
+  const call = async (method, params) => {
+    const r = await fetch(`${TG_API}/bot${creds.token}/${method}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(params || {}),
+      signal: AbortSignal.timeout(30000),
+    });
+    return r.json(); // Telegram always replies JSON, even on errors
+  };
+  return {
+    mode: 'bot',
+    call,
+    async init() {},
+    async copy(id) {
+      let res;
+      try { res = await call('copyMessage', { chat_id: state.dest, from_chat_id: state.source, message_id: id }); }
+      catch (e) { return { kind: 'transient', msg: e.message }; }
+      if (res.ok) return { kind: 'copied' };
+      const code = res.error_code, desc = res.description || '';
+      if (code === 429) return { kind: 'flood', seconds: (res.parameters && res.parameters.retry_after) || 30 };
+      if (code >= 500) return { kind: 'transient', msg: `Telegram ${code} ${desc}` };
+      if (code === 400 && SKIP_RE.test(desc)) return { kind: 'skipped' };
+      if (code === 401 || code === 403 || code === 404 || FATAL_RE.test(desc)) return { kind: 'fatal', msg: `${code} ${desc}` };
+      return { kind: 'skipped', msg: `${code} ${desc}` }; // odd message: don't hang the whole job
+    },
+    async close() {},
+  };
+}
+
+// ---------- driver: user account (GramJS / MTProto) ----------
+function gram() {
+  try { return { ...require('telegram'), Sessions: require('telegram/sessions'), Helpers: require('telegram/Helpers') }; }
+  catch (e) { throw new Fatal('The "telegram" npm package is not installed on the server (run npm install).'); }
+}
+
+async function connectUser(creds) {
+  const g = gram();
+  const client = new g.TelegramClient(new g.Sessions.StringSession(creds.session), Number(creds.apiId), creds.apiHash, {
+    connectionRetries: 5,
+    floodSleepThreshold: 0, // we handle flood waits ourselves
+  });
+  try { client.setLogLevel('error'); } catch {}
+  await client.connect();
+  let authed = true;
+  try { authed = typeof client.checkAuthorization === 'function' ? await client.checkAuthorization() : true; } catch {}
+  if (!authed) { try { await client.disconnect(); } catch {} throw new Fatal('Session is not logged in or was revoked. Generate a new session.'); }
+  return client;
+}
+
+async function findDialogs(client, ids) {
+  const want = new Set(ids.map(String)), found = {};
+  for await (const d of client.iterDialogs({ limit: 3000 })) {
+    const id = String(d.id);
+    if (want.has(id)) {
+      found[id] = { title: d.title || (d.entity && d.entity.title) || id, input: d.inputEntity, entity: d.entity };
+      if (Object.keys(found).length === want.size) break;
+    }
+  }
+  return found;
+}
+
+async function userRole(client, chat) {
+  const g = gram();
+  try {
+    const r = await client.invoke(new g.Api.channels.GetParticipant({ channel: chat.input, participant: new g.Api.InputPeerSelf() }));
+    const p = r.participant, cls = p && p.className;
+    if (cls === 'ChannelParticipantCreator') return { role: 'creator', canPost: true };
+    if (cls === 'ChannelParticipantAdmin') {
+      const rights = p.adminRights || {};
+      return { role: 'admin', canPost: !!rights.postMessages || !!(chat.entity && chat.entity.megagroup) };
+    }
+    return { role: 'member', canPost: false };
+  } catch (e) {
+    if (/USER_NOT_PARTICIPANT/.test(errText(e))) return { role: 'none', canPost: false };
+    throw e;
+  }
+}
+
+function mapUserError(e) {
+  const m = errText(e);
+  if ((e && Number(e.seconds) > 0) || /FLOOD_WAIT|FLOOD_PREMIUM_WAIT|SLOWMODE_WAIT/.test(m)) {
+    return { kind: 'flood', seconds: Number(e && e.seconds) || Number((m.match(/(\d+)/) || [])[1]) || 60 };
+  }
+  if (/MESSAGE_ID_INVALID|MESSAGE_ID_REQUIRED|MSG_ID_INVALID/.test(m)) return { kind: 'skipped' };
+  if (/CHAT_FORWARDS_RESTRICTED|CHAT_ADMIN_REQUIRED|CHAT_WRITE_FORBIDDEN|USER_BANNED_IN_CHANNEL|CHANNEL_PRIVATE|CHANNEL_INVALID|PEER_ID_INVALID|AUTH_KEY|SESSION_REVOKED|SESSION_EXPIRED|USER_DEACTIVATED|CHAT_SEND_.*FORBIDDEN/.test(m)) {
+    return { kind: 'fatal', msg: m };
+  }
+  if (e && e.errorMessage) return { kind: 'skipped', msg: m }; // unknown RPC error on one message
+  return { kind: 'transient', msg: m }; // network / disconnected
+}
+
+function userDriver(creds) {
+  let client = null, src = null, dst = null;
+  const self = {
+    mode: 'user',
+    session: creds.session,
+    get client() { return client; },
+    async init() {
+      if (client) await self.close();
+      client = await connectUser(creds);
+      const f = await findDialogs(client, [state.source, state.dest]);
+      if (!f[state.source]) throw new Fatal('Source channel not found in this account (join it first).');
+      if (!f[state.dest]) throw new Fatal('Destination channel not found in this account.');
+      src = f[state.source].input; dst = f[state.dest].input;
+    },
+    async copy(id) {
+      const g = gram();
+      try {
+        const res = await client.invoke(new g.Api.messages.ForwardMessages({
+          fromPeer: src, toPeer: dst, id: [id],
+          randomId: [g.Helpers.generateRandomBigInt()],
+          dropAuthor: true, // no "Forwarded from" header
+        }));
+        const ups = (res && res.updates) || [];
+        const ok = ups.some((u) => u && ['UpdateMessageID', 'UpdateNewChannelMessage', 'UpdateNewMessage'].includes(u.className));
+        return ok ? { kind: 'copied' } : { kind: 'skipped' };
+      } catch (e) { return mapUserError(e); }
+    },
+    async close() {
+      const c = client; client = null;
+      if (c) { try { await c.disconnect(); } catch {} try { if (c.destroy) await c.destroy(); } catch {} }
+    },
+  };
+  return self;
+}
+
+// ---------- copy loop ----------
+let driver = null;
 
 async function copyOne(id) {
   let fails = 0;
@@ -137,57 +314,58 @@ async function copyOne(id) {
     if (stopRequested || shuttingDown) return 'stopped';
     await pace();
     if (stopRequested || shuttingDown) return 'stopped';
-    let res;
-    try {
-      res = await tg('copyMessage', { chat_id: state.dest, from_chat_id: state.source, message_id: id });
-    } catch (e) { // network down, timeout, bad JSON ...
-      fails++;
-      const w = Math.min(60000, 2000 * 2 ** Math.min(fails, 5));
-      log(`network error (${e.message}); retry in ${w / 1000}s`);
-      await sleep(w);
-      continue;
-    }
-    if (res.ok) {
+    const r = await driver.copy(id);
+    if (r.kind === 'copied') {
       lastWasSkip = false;
       if (++okStreak >= 100) { okStreak = 0; delay = Math.max(BASE_DELAY, Math.round(delay * 0.9)); }
       return 'copied';
     }
-    const code = res.error_code, desc = res.description || '';
-    if (code === 429) {
-      const ra = (res.parameters && res.parameters.retry_after) || 30;
+    if (r.kind === 'skipped') {
+      if (r.msg) log(`skipping id ${id}: ${r.msg}`);
+      lastWasSkip = true;
+      return 'skipped';
+    }
+    if (r.kind === 'flood') {
       okStreak = 0;
       delay = Math.min(MAX_DELAY, Math.round(delay * 1.3) + 200);
-      log(`429 flood limit: waiting ${ra + 1}s, then retrying id ${id} (delay now ${delay}ms)`);
+      log(`flood limit: waiting ${r.seconds + 1}s, then retrying id ${id} (delay now ${delay}ms)`);
       persist(true);
-      await sleep((ra + 1) * 1000);
+      await sleep((r.seconds + 1) * 1000);
       continue;
     }
-    if (code >= 500) {
+    if (r.kind === 'transient') {
       fails++;
       const w = Math.min(60000, 2000 * 2 ** Math.min(fails, 5));
-      log(`Telegram ${code} (${desc}); retry in ${w / 1000}s`);
+      log(`temporary error (${r.msg}); retry in ${w / 1000}s`);
       await sleep(w);
+      if (driver.mode === 'user' && fails % 5 === 0) {
+        try { await driver.init(); log('reconnected'); } catch (e) { if (e instanceof Fatal) throw e; }
+      }
       continue;
     }
-    if (code === 400 && SKIP_RE.test(desc)) { lastWasSkip = true; return 'skipped'; }
-    if (code === 401 || code === 403 || code === 404 || FATAL_RE.test(desc)) {
-      throw new Fatal(`${code} ${desc}`);
-    }
-    // any other 400: don't hang the whole job on one odd message
-    log(`skipping id ${id}: ${code} ${desc}`);
-    lastWasSkip = true;
-    return 'skipped';
+    throw new Fatal(r.msg); // fatal
   }
 }
 
-// ---------- job runner ----------
 let running = false;
 async function runJob() {
   if (running) return;
   running = true; stopRequested = false;
-  log(`job running: ${state.source} -> ${state.dest}, ids ${state.next}..${state.to}`);
   try {
+    if (!state.creds) throw new Fatal('No saved credentials. Start a new job.');
+    addSecrets(state.creds);
+    driver = state.creds.mode === 'user' ? userDriver(state.creds) : botDriver(state.creds);
+    log(`job running (${state.creds.mode}): ${state.source} -> ${state.dest}, ids ${state.next}..${state.to}`);
     state.status = 'running'; state.lastError = null; persist(true);
+    for (;;) { // connect (with retry for network problems)
+      try { await driver.init(); break; }
+      catch (e) {
+        if (e instanceof Fatal) throw e;
+        log('connect failed: ' + errText(e) + ' - retrying in 15s');
+        await sleep(15000);
+        if (stopRequested || shuttingDown) break;
+      }
+    }
     while (state.next <= state.to) {
       const r = await copyOne(state.next);
       if (r === 'stopped') {
@@ -200,19 +378,164 @@ async function runJob() {
     }
     if (state.next > state.to) { state.status = 'done'; log(`done. copied=${state.copied} skipped=${state.skipped}`); }
   } catch (e) {
-    state.status = 'error'; state.lastError = e.message;
-    log('STOPPED with error: ' + e.message);
+    state.status = 'error'; state.lastError = errText(e);
+    log('STOPPED with error: ' + errText(e));
   } finally {
-    running = false; persist(true);
+    running = false;
+    const d = driver; driver = null;
+    if (d) { try { await d.close(); } catch {} }
+    persist(true);
   }
 }
 
 // watchdog: if a job should be running but isn't (unexpected bug), restart it
 setInterval(() => {
-  if (state.status === 'running' && !running && !shuttingDown) {
-    log('watchdog: restarting job'); runJob();
-  }
+  if (state.status === 'running' && !running && !shuttingDown) { log('watchdog: restarting job'); runJob(); }
 }, 30000).unref();
+
+// ---------- setup check ----------
+async function checkBot(token, source, dest) {
+  const drv = botDriver({ token });
+  const me = await drv.call('getMe');
+  if (!me.ok) throw new Error('Bot token rejected by Telegram: ' + (me.description || 'invalid'));
+  const account = { name: me.result.first_name, username: me.result.username ? '@' + me.result.username : '', id: me.result.id };
+  const one = async (id, needPost) => {
+    const o = { id, title: null, ok: false, role: null, note: '' };
+    const c = await drv.call('getChat', { chat_id: id });
+    if (!c.ok) { o.note = c.description || 'cannot access'; return o; }
+    o.title = c.result.title || String(id);
+    const m = await drv.call('getChatMember', { chat_id: id, user_id: me.result.id });
+    if (!m.ok) { o.note = m.description || 'cannot read membership'; return o; }
+    const st = m.result.status; o.role = st;
+    if (needPost) {
+      if (st === 'creator') o.ok = true;
+      else if (st === 'administrator') { o.ok = m.result.can_post_messages !== false; if (!o.ok) o.note = 'Admin, but "Post messages" is off'; }
+      else o.note = 'Bot must be ADMIN here';
+    } else {
+      o.ok = ['creator', 'administrator', 'member'].includes(st);
+      if (!o.ok) o.note = 'Bot is not in this channel (add it as admin)';
+    }
+    return o;
+  };
+  return { account, source: await one(source, false), dest: await one(dest, true) };
+}
+
+async function checkUser(creds, source, dest) {
+  // reuse the running job's connection if it is the same session (avoid two connections)
+  const reuse = driver && driver.mode === 'user' && driver.session === creds.session && driver.client;
+  const client = reuse ? driver.client : await connectUser(creds);
+  try {
+    const me = await client.getMe();
+    const account = {
+      name: [me.firstName, me.lastName].filter(Boolean).join(' ') || me.username || String(me.id),
+      username: me.username ? '@' + me.username : '', id: String(me.id),
+    };
+    const f = await findDialogs(client, [source, dest]);
+    const one = async (id, needPost) => {
+      const o = { id, title: null, ok: false, role: null, note: '' };
+      const chat = f[id];
+      if (!chat) { o.note = 'This account has not joined this channel (or the ID is wrong)'; return o; }
+      o.title = chat.title;
+      const r = await userRole(client, chat);
+      o.role = r.role;
+      if (needPost) { o.ok = r.canPost; if (!o.ok) o.note = r.role === 'admin' ? 'Admin, but "Post messages" is off' : 'Account must be ADMIN here'; }
+      else o.ok = r.role !== 'none';
+      if (!o.ok && !o.note) o.note = 'Account is not in this channel';
+      return o;
+    };
+    return { account, source: await one(source, false), dest: await one(dest, true) };
+  } finally {
+    if (!reuse) { try { await client.disconnect(); } catch {} try { if (client.destroy) await client.destroy(); } catch {} }
+  }
+}
+
+const ID_RE = /^-\d{6,}$/;
+function parseCreds(body) {
+  const mode = body.mode === 'user' ? 'user' : 'bot';
+  if (mode === 'bot') {
+    const token = String(body.token || ENV_BOT_TOKEN || '').trim();
+    if (!/^\d{5,}:[\w-]{20,}$/.test(token)) throw new Error('Enter a valid bot token (looks like 123456:ABC-DEF...)');
+    return { mode, token };
+  }
+  if (!encKey) throw new Error('Set the ENC_KEY environment variable on Render first (needed to store the session safely).');
+  const apiId = String(body.apiId || '').trim(), apiHash = String(body.apiHash || '').trim(), session = String(body.session || '').trim();
+  if (!/^\d{3,12}$/.test(apiId)) throw new Error('API ID must be a number (from my.telegram.org)');
+  if (!/^[0-9a-f]{32}$/i.test(apiHash)) throw new Error('API hash must be 32 hex characters (from my.telegram.org)');
+  if (session.length < 20) throw new Error('Enter the session string (use "Generate session")');
+  return { mode, apiId, apiHash, session };
+}
+function parseIds(body) {
+  const source = String(body.source || '').trim(), dest = String(body.dest || '').trim();
+  if (!ID_RE.test(source) || !ID_RE.test(dest)) throw new Error('Channel IDs must look like -1001234567890');
+  if (source === dest) throw new Error('Source and destination are the same');
+  return { source, dest };
+}
+async function runCheck(body) {
+  const creds = parseCreds(body);
+  const { source, dest } = parseIds(body);
+  addSecrets(creds);
+  const r = creds.mode === 'bot' ? await checkBot(creds.token, source, dest) : await checkUser(creds, source, dest);
+  return { mode: creds.mode, ...r, ok: r.source.ok && r.dest.ok, creds };
+}
+
+// ---------- user-account login (OTP) ----------
+let pending = null;
+function cancelPending() {
+  if (pending) { const c = pending.client; pending = null; try { c.disconnect(); } catch {} }
+}
+setInterval(() => { if (pending && now() - pending.createdAt > 10 * 60e3) cancelPending(); }, 30000).unref();
+
+const pubPending = (p) => ({ state: p.state, error: p.error, session: p.state === 'done' ? p.session : undefined });
+async function waitPending(p, seq, ms = 45000) {
+  const end = now() + ms;
+  while (p.seq === seq && now() < end) await new Promise((r) => setTimeout(r, 200));
+  const out = pubPending(p);
+  if (p.state === 'done' || p.state === 'error') { if (pending === p) pending = null; }
+  return out;
+}
+
+async function sessionStart(body) {
+  if (!encKey) throw new Error('Set the ENC_KEY environment variable on Render first (needed to store the session safely).');
+  const apiId = String(body.apiId || '').trim(), apiHash = String(body.apiHash || '').trim(), phone = String(body.phone || '').replace(/[\s-]/g, '');
+  if (!/^\d{3,12}$/.test(apiId)) throw new Error('API ID must be a number (from my.telegram.org)');
+  if (!/^[0-9a-f]{32}$/i.test(apiHash)) throw new Error('API hash must be 32 hex characters');
+  if (!/^\+\d{7,15}$/.test(phone)) throw new Error('Phone must include country code, e.g. +919876543210');
+  const g = gram();
+  cancelPending();
+  const client = new g.TelegramClient(new g.Sessions.StringSession(''), Number(apiId), apiHash, { connectionRetries: 3, floodSleepThreshold: 0 });
+  try { client.setLogLevel('error'); } catch {}
+  const p = { client, state: 'starting', seq: 0, error: null, session: null, lastErr: null, resolveCode: null, resolvePass: null, createdAt: now() };
+  pending = p;
+  const set = (st, err) => { p.state = st; p.error = err || null; p.seq++; };
+  client.start({
+    phoneNumber: async () => phone,
+    phoneCode: () => new Promise((res) => { p.resolveCode = res; const e = p.lastErr; p.lastErr = null; set('need_code', e); }),
+    password: () => new Promise((res) => { p.resolvePass = res; const e = p.lastErr; p.lastErr = null; set('need_password', e); }),
+    onError: async (e) => {
+      const m = errText(e);
+      if (/PHONE_CODE_INVALID|PHONE_CODE_EMPTY/.test(m)) { p.lastErr = 'Wrong code, try again'; return false; }
+      if (/PASSWORD_HASH_INVALID/.test(m)) { p.lastErr = 'Wrong password, try again'; return false; }
+      set('error', m);
+      return true; // stop
+    },
+  }).then(async () => {
+    p.session = client.session.save();
+    addSecrets({ session: p.session });
+    set('done');
+    try { await client.disconnect(); } catch {}
+  }).catch((e) => { if (p.state !== 'error') set('error', errText(e)); });
+  return waitPending(p, 0);
+}
+async function sessionStep(kind, value) {
+  const p = pending;
+  if (!p) throw new Error('No login in progress (it expires after 10 minutes). Start again.');
+  if (kind === 'code') {
+    if (p.state !== 'need_code') throw new Error('Not waiting for a code');
+    const seq = p.seq; p.resolveCode(String(value || '').replace(/\s/g, '')); return waitPending(p, seq);
+  }
+  if (p.state !== 'need_password') throw new Error('Not waiting for a password');
+  const seq = p.seq; p.resolvePass(String(value || '')); return waitPending(p, seq);
+}
 
 // ---------- auth ----------
 let fails = 0, lockedUntil = 0, lockLevel = 0;
@@ -232,60 +555,34 @@ function checkPin(pin) {
 // ---------- HTTP ----------
 function send(res, code, obj, origin) {
   const h = { 'Content-Type': 'application/json' };
-  if (origin && origin === ALLOWED_ORIGIN) {
-    h['Access-Control-Allow-Origin'] = origin;
-    h['Vary'] = 'Origin';
-  }
+  if (origin && origin === ALLOWED_ORIGIN) { h['Access-Control-Allow-Origin'] = origin; h['Vary'] = 'Origin'; }
   res.writeHead(code, h);
   res.end(JSON.stringify(obj));
 }
-
 function readBody(req) {
   return new Promise((resolve, reject) => {
     let s = '';
-    req.on('data', (c) => { s += c; if (s.length > 10000) { reject(new Error('too large')); req.destroy(); } });
+    req.on('data', (c) => { s += c; if (s.length > 20000) { reject(new Error('too large')); req.destroy(); } });
     req.on('end', () => { try { resolve(s ? JSON.parse(s) : {}); } catch (e) { reject(e); } });
     req.on('error', reject);
   });
 }
-
-const snapshot = () => ({ ...state, running, delayMs: delay, logs: logs.slice(-25) });
-
-let botId = null;
-async function verifyChats(source, dest) {
-  if (!botId) {
-    const me = await tg('getMe');
-    if (!me.ok) throw new Error('Bot token rejected by Telegram: ' + me.description);
-    botId = me.result.id;
-  }
-  const s = await tg('getChatMember', { chat_id: source, user_id: botId });
-  if (!s.ok) throw new Error('Source channel: ' + s.description + ' (add the bot to the source channel as admin)');
-  if (['left', 'kicked'].includes(s.result.status)) throw new Error('Bot is not in the source channel');
-  const d = await tg('getChatMember', { chat_id: dest, user_id: botId });
-  if (!d.ok) throw new Error('Destination channel: ' + d.description);
-  if (!['administrator', 'creator'].includes(d.result.status)) throw new Error('Bot must be ADMIN in the destination channel');
-  if (d.result.status === 'administrator' && d.result.can_post_messages === false) {
-    throw new Error('Bot is admin in destination but lacks the "Post messages" permission');
-  }
-}
+const snapshot = () => {
+  const { creds, ...rest } = state;
+  return { ...rest, running, delayMs: delay, encrypted: !!encKey, envBotToken: !!ENV_BOT_TOKEN, logs: logs.slice(-25) };
+};
 
 const server = http.createServer(async (req, res) => {
   const origin = req.headers.origin;
   const path = (req.url || '').split('?')[0];
 
-  if (path === '/health' || path === '/') { // for UptimeRobot, no secrets
-    res.writeHead(200, { 'Content-Type': 'text/plain' });
-    return res.end('ok');
-  }
+  if (path === '/health' || path === '/') { res.writeHead(200, { 'Content-Type': 'text/plain' }); return res.end('ok'); }
 
   if (req.method === 'OPTIONS') { // CORS preflight
     if (origin !== ALLOWED_ORIGIN) { res.writeHead(403); return res.end(); }
     res.writeHead(204, {
-      'Access-Control-Allow-Origin': origin,
-      'Access-Control-Allow-Methods': 'POST, OPTIONS',
-      'Access-Control-Allow-Headers': 'Content-Type',
-      'Access-Control-Max-Age': '600',
-      Vary: 'Origin',
+      'Access-Control-Allow-Origin': origin, 'Access-Control-Allow-Methods': 'POST, OPTIONS',
+      'Access-Control-Allow-Headers': 'Content-Type', 'Access-Control-Max-Age': '600', Vary: 'Origin',
     });
     return res.end();
   }
@@ -305,6 +602,16 @@ const server = http.createServer(async (req, res) => {
   try {
     if (path === '/status') return send(res, 200, snapshot(), origin);
 
+    if (path === '/check') {
+      const { creds, ...out } = await runCheck(body);
+      return send(res, 200, out, origin);
+    }
+
+    if (path === '/session/start') return send(res, 200, await sessionStart(body), origin);
+    if (path === '/session/code') return send(res, 200, await sessionStep('code', body.code), origin);
+    if (path === '/session/password') return send(res, 200, await sessionStep('password', body.password), origin);
+    if (path === '/session/cancel') { cancelPending(); return send(res, 200, { ok: true }, origin); }
+
     if (path === '/stop') {
       stopRequested = true;
       if (!running && state.status === 'running') { state.status = 'stopped'; persist(true); }
@@ -321,18 +628,19 @@ const server = http.createServer(async (req, res) => {
 
     if (path === '/start') {
       if (running) return send(res, 409, { error: 'A job is already running. Stop it first.' }, origin);
-      const idRe = /^-\d{6,}$/;
-      const source = String(body.source || '').trim(), dest = String(body.dest || '').trim();
       const from = Number(body.from), to = Number(body.to);
-      if (!idRe.test(source) || !idRe.test(dest)) return send(res, 400, { error: 'Channel IDs must look like -1001234567890' }, origin);
-      if (source === dest) return send(res, 400, { error: 'Source and destination are the same' }, origin);
       if (!Number.isInteger(from) || !Number.isInteger(to) || from < 1 || to < from) {
         return send(res, 400, { error: 'Message IDs: whole numbers, start >= 1 and end >= start' }, origin);
       }
-      await verifyChats(source, dest);
+      const c = await runCheck(body); // same checks as the popup
+      if (!c.ok) {
+        const bad = [c.source.ok ? '' : 'Source: ' + c.source.note, c.dest.ok ? '' : 'Destination: ' + c.dest.note].filter(Boolean).join(' | ');
+        return send(res, 400, { error: 'Setup check failed. ' + bad }, origin);
+      }
       state = {
-        status: 'running', source, dest, from, to, next: from,
-        copied: 0, skipped: 0, lastError: null, startedAt: now(), updatedAt: now(),
+        status: 'running', mode: c.mode, source: String(body.source).trim(), dest: String(body.dest).trim(), from, to,
+        sourceTitle: c.source.title, destTitle: c.dest.title, accountName: c.account.name,
+        next: from, copied: 0, skipped: 0, lastError: null, startedAt: now(), updatedAt: now(), creds: c.creds,
       };
       delay = BASE_DELAY; okStreak = 0; lastWasSkip = false;
       persist(true);
@@ -342,7 +650,7 @@ const server = http.createServer(async (req, res) => {
 
     return send(res, 404, { error: 'Not found' }, origin);
   } catch (e) {
-    return send(res, 400, { error: e.message }, origin);
+    return send(res, 400, { error: errText(e) }, origin);
   }
 });
 
