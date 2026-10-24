@@ -48,6 +48,9 @@
   .chk .ic{font-size:1.2rem;line-height:1.2}
   .chk b{display:block}
   .hide{display:none}
+  .sub{margin:8px 0 0 22px;padding-left:12px;border-left:2px solid var(--bd)}
+  #calc{margin-top:8px;font-size:.85rem}
+  #calc div{margin-top:2px}
 </style>
 </head>
 <body>
@@ -76,7 +79,7 @@
     <div id="botBox">
       <label for="token">Bot token</label>
       <input id="token" type="password" autocomplete="off" placeholder="123456:ABC-DEF… (blank = token set in Render)">
-      <small class="hint">Bot must be admin in the source and in the destination channel.</small>
+      <small class="hint">Channels: the bot must be admin (destination: with Post messages). Groups: the bot must be a member (destination: able to send).</small>
       <label for="notifyId">Send progress to Telegram user ID (optional)</label>
       <input id="notifyId" inputmode="numeric" autocomplete="off" placeholder="123456789">
       <small class="hint">That user must have pressed Start on the bot once. One message is edited in place.</small>
@@ -85,7 +88,7 @@
     <div id="userBox" class="hide">
       <label for="session">Session string</label>
       <textarea id="session" rows="3" autocomplete="off" spellcheck="false" placeholder="Paste a saved session, or generate one below"></textarea>
-      <small class="hint">GramJS / Telethon string session. Account needs to be a member of the source and admin of the destination.</small>
+      <small class="hint">GramJS / Telethon string session. Source: member. Destination: admin of a channel, or a member who can send in a group.</small>
       <div class="row">
         <div><label for="apiId">API ID</label><input id="apiId" inputmode="numeric" autocomplete="off" placeholder="1234567"></div>
         <div><label for="apiHash">API hash</label><input id="apiHash" type="password" autocomplete="off" placeholder="32 characters"></div>
@@ -95,11 +98,31 @@
       <label class="ck"><input id="notifySaved" type="checkbox" checked> Show progress in my “Saved Messages”</label>
     </div>
 
-    <label for="src">Source channel ID</label>
+    <label for="src">Source ID (channel or group)</label>
     <input id="src" placeholder="-1001234567890" inputmode="numeric" autocomplete="off">
+    <label class="ck"><input id="srcGroup" type="checkbox"> Source is a group</label>
+    <div id="srcG" class="sub hide">
+      <label class="ck" style="margin-top:0"><input id="srcForum" type="checkbox"> Group has topics</label>
+      <div id="srcT" class="hide">
+        <div id="srcTopicBox">
+          <label for="srcTopic">Topic ID (empty = copy all topics)</label>
+          <input id="srcTopic" inputmode="numeric" autocomplete="off" placeholder="e.g. 5">
+        </div>
+        <small id="srcBotNote" class="hint hide">Bot mode copies every topic in the ID range (a bot cannot filter by topic). Use “My account” to copy a single topic.</small>
+        <small class="hint">Topic ID: right-click a message inside the topic → Copy link → <code>t.me/c/123/<b>TOPIC</b>/456</code>. General topic = 1.</small>
+      </div>
+    </div>
 
-    <label for="dst">Destination channel ID</label>
+    <label for="dst">Destination ID (channel or group)</label>
     <input id="dst" placeholder="-1009876543210" inputmode="numeric" autocomplete="off">
+    <label class="ck"><input id="dstGroup" type="checkbox"> Destination is a group</label>
+    <div id="dstG" class="sub hide">
+      <label class="ck" style="margin-top:0"><input id="dstForum" type="checkbox"> Group has topics</label>
+      <div id="dstT" class="hide">
+        <label for="dstTopic">Topic ID to post into (empty = General)</label>
+        <input id="dstTopic" inputmode="numeric" autocomplete="off" placeholder="e.g. 7">
+      </div>
+    </div>
 
     <div class="row">
       <div><label for="from">Start message ID</label><input id="from" type="number" min="1" placeholder="1"></div>
@@ -108,7 +131,7 @@
 
     <label for="delay">Delay between messages (seconds)</label>
     <input id="delay" type="number" min="0.5" max="60" step="0.5" value="3">
-    <small class="hint">3 s = Telegram's 20 messages/minute per chat. Lower is faster but triggers flood waits (handled automatically).</small>
+    <div id="calc"></div>
 
     <div class="btns">
       <button id="bCheck" class="sec">Check setup</button>
@@ -171,24 +194,25 @@
 <script>
 const $ = (id) => document.getElementById(id);
 const DEFAULT_URL = 'https://tg-channel-clone.onrender.com';
-const SAVE = ['api', 'src', 'dst', 'from', 'to', 'apiId', 'apiHash', 'session', 'token', 'delay', 'notifyId']; // everything except the PIN
+const SAVE = ['api', 'src', 'dst', 'from', 'to', 'apiId', 'apiHash', 'session', 'token', 'delay', 'notifyId', 'srcTopic', 'dstTopic']; // everything except the PIN
+const CK = ['notifySaved', 'srcGroup', 'srcForum', 'dstGroup', 'dstForum']; // saved tick boxes
 let mode = 'bot';
 
 $('api').value = DEFAULT_URL;
 try {
   SAVE.forEach((k) => { const v = localStorage.getItem('cc_' + k); if (v) $(k).value = v; });
-  const ns = localStorage.getItem('cc_notifySaved'); if (ns !== null) $('notifySaved').checked = ns === '1';
+  CK.forEach((k) => { const v = localStorage.getItem('cc_' + k); if (v !== null) $(k).checked = v === '1'; });
   if (localStorage.getItem('cc_mode') === 'user') setMode('user');
   const p = sessionStorage.getItem('cc_pin'); if (p) $('pin').value = p; // survives reload, gone when the tab closes
 } catch {}
 const persist = () => {
   try {
     SAVE.forEach((k) => localStorage.setItem('cc_' + k, $(k).value));
-    localStorage.setItem('cc_notifySaved', $('notifySaved').checked ? '1' : '0');
+    CK.forEach((k) => localStorage.setItem('cc_' + k, $(k).checked ? '1' : '0'));
     localStorage.setItem('cc_mode', mode);
   } catch {}
 };
-document.addEventListener('input', (e) => { if (e.target.id !== 'pin') persist(); }); // save as you type
+document.addEventListener('input', (e) => { if (e.target.id !== 'pin') { persist(); syncUI(); } }); // save as you type
 $('pin').addEventListener('input', () => { try { sessionStorage.setItem('cc_pin', $('pin').value); } catch {} if ($('pin').value.length === 4) refresh(false); });
 
 function setMode(m) {
@@ -197,6 +221,7 @@ function setMode(m) {
   $('tUser').classList.toggle('on', m === 'user');
   $('botBox').classList.toggle('hide', m !== 'bot');
   $('userBox').classList.toggle('hide', m !== 'user');
+  syncUI();
 }
 $('tBot').onclick = () => setMode('bot');
 $('tUser').onclick = () => setMode('user');
@@ -229,7 +254,11 @@ async function call(path, extra) {
 
 // everything the server needs to run a job, per the selected mode
 function jobFields() {
-  const base = { mode, source: $('src').value.trim(), dest: $('dst').value.trim(), delaySec: $('delay').value };
+  const base = {
+    mode, source: $('src').value.trim(), dest: $('dst').value.trim(), delaySec: $('delay').value,
+    srcGroup: $('srcGroup').checked, srcForum: $('srcForum').checked, srcTopic: $('srcTopic').value.trim(),
+    dstGroup: $('dstGroup').checked, dstForum: $('dstForum').checked, dstTopic: $('dstTopic').value.trim(),
+  };
   if (mode === 'bot') return { ...base, token: $('token').value.trim(), notifyUserId: $('notifyId').value.trim() };
   return { ...base, apiId: $('apiId').value.trim(), apiHash: $('apiHash').value.trim(), session: $('session').value.trim(), notifySaved: $('notifySaved').checked };
 }
@@ -262,12 +291,13 @@ async function refresh(quiet) {
 
 async function act(btn, path, extra, okText) {
   btn.disabled = true; say('Working…');
-  try { await call(path, extra); say(okText, 'good'); persist(); await refresh(true); }
+  try { const res = await call(path, extra); say(typeof okText === 'function' ? okText(res) : okText, 'good'); persist(); await refresh(true); }
   catch (e) { say(e.message, 'err'); }
   finally { btn.disabled = false; }
 }
 
-$('bStart').onclick = (e) => act(e.target, '/start', { ...jobFields(), from: $('from').value, to: $('to').value }, 'Started.');
+$('bStart').onclick = (e) => act(e.target, '/start', { ...jobFields(), from: $('from').value, to: $('to').value },
+  (r) => 'Started.' + (r.delayMs > Number($('delay').value) * 1000 + 1 ? ` Delay raised to ${r.delayMs / 1000} s (Telegram limit).` : ''));
 $('bResume').onclick = (e) => act(e.target, '/resume', {}, 'Resumed.');
 $('bStop').onclick = (e) => act(e.target, '/stop', {}, 'Stop requested.');
 
@@ -286,8 +316,10 @@ $('bCheck').onclick = async (e) => {
     const r = await call('/check', jobFields());
     const body = $('checkBody'); body.replaceChildren();
     body.appendChild(row(true, (r.mode === 'user' ? 'Account: ' : 'Bot: ') + r.account.name, [r.account.username, 'ID ' + r.account.id]));
-    body.appendChild(row(r.source.ok, 'Source: ' + (r.source.title || r.source.id), [`Role: ${r.source.role || '—'}`, r.source.ok ? 'Can read from here' : r.source.note]));
-    body.appendChild(row(r.dest.ok, 'Destination: ' + (r.dest.title || r.dest.id), [`Role: ${r.dest.role || '—'}`, r.dest.ok ? 'Can post here' : r.dest.note]));
+    const kindTxt = (o) => o.kind ? `Type: ${o.kind}${o.forum ? ' with topics' : ''}` : '';
+    const so = (r.opts && r.opts.src) || {}, dop = (r.opts && r.opts.dst) || {};
+    body.appendChild(row(r.source.ok, 'Source: ' + (r.source.title || r.source.id), [`Role: ${r.source.role || '—'}`, kindTxt(r.source), so.topic ? `Only topic ${so.topic} will be copied` : (r.source.forum ? 'All topics will be copied' : ''), r.source.ok ? 'Can read from here' : '', r.source.note]));
+    body.appendChild(row(r.dest.ok, 'Destination: ' + (r.dest.title || r.dest.id), [`Role: ${r.dest.role || '—'}`, kindTxt(r.dest), dop.topic ? `Posting into topic ${dop.topic}` : '', r.dest.ok ? 'Can post here' : '', r.dest.note]));
     if (r.notify) body.appendChild(row(r.notify.ok, 'Progress messages: ' + r.notify.name, [r.notify.ok ? 'Progress will be shown here' : r.notify.note]));
     const sum = document.createElement('p'); sum.className = r.ok ? 'good' : 'err';
     sum.textContent = r.ok ? 'All good. You can press Start.' : 'Fix the items marked ❌, then check again.';
@@ -320,18 +352,57 @@ $('sPassGo').onclick = (e) => sRun(e.target, () => call('/session/password', { p
 $('sCopy').onclick = async () => { try { await navigator.clipboard.writeText($('session').value); $('sMsg').textContent = ''; $('sCopy').textContent = 'Copied'; } catch { $('session').select(); } };
 document.querySelectorAll('[data-close]').forEach((b) => b.onclick = () => { $('dSess').close(); call('/session/cancel', {}).catch(() => {}); $('sp').value = ''; });
 
+// ----- toggles + live delay calculation -----
+// Telegram limits (as you specified): bot -> group 20 msgs/min (3 s), bot -> channel/chat 1 msg/s, account 1 msg/s
+function limitInfo() {
+  if (mode === 'user') return { min: 1, text: 'account limit: 1 message per second' };
+  if ($('dstGroup').checked) return { min: 3, text: 'bot limit for a group: 20 messages per minute (3 s each)' };
+  return { min: 1, text: 'bot limit for a channel/chat: 1 message per second' };
+}
+function fmtDur(sec) {
+  sec = Math.round(sec);
+  if (sec < 60) return sec + ' s';
+  const h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60), x = sec % 60;
+  return (h ? h + ' h ' : '') + (m ? m + ' min ' : '') + (!h && x ? x + ' s' : '');
+}
+function updateCalc() {
+  const box = $('calc'); box.replaceChildren();
+  const add = (t, cls) => { const d = document.createElement('div'); d.textContent = t; if (cls) d.className = cls; box.appendChild(d); };
+  const d = Number($('delay').value);
+  if (!(d > 0)) { add('Enter a delay in seconds.', 'hint'); return; }
+  const perMin = 60 / d;
+  let line = `${d} s per message = ${Number.isInteger(perMin) ? perMin : perMin.toFixed(1)} messages/min`;
+  const n = Number($('to').value) - Number($('from').value) + 1;
+  if (Number.isFinite(n) && n > 0 && $('from').value && $('to').value) line += ` · ${n} IDs ≈ ${fmtDur(n * d)} at most (deleted IDs go faster)`;
+  add(line, 'hint');
+  const lim = limitInfo();
+  if (d < lim.min) add(`⛔ Above the ${lim.text}. The server will use ${lim.min} s instead.`, 'err');
+  else if (d < lim.min * 1.25) add(`⚠ Close to the ${lim.text}. Flood waits are likely.`, 'warn');
+}
+function syncUI() {
+  $('srcG').classList.toggle('hide', !$('srcGroup').checked);
+  $('srcT').classList.toggle('hide', !($('srcGroup').checked && $('srcForum').checked));
+  $('srcTopicBox').classList.toggle('hide', mode === 'bot');
+  $('srcBotNote').classList.toggle('hide', mode !== 'bot');
+  $('dstG').classList.toggle('hide', !$('dstGroup').checked);
+  $('dstT').classList.toggle('hide', !($('dstGroup').checked && $('dstForum').checked));
+  updateCalc();
+}
+
 // ----- Clear all data (manual): wipes saved fields, PIN and everything typed on the page -----
 $('bClear').onclick = () => {
   if (!confirm('Clear all saved and typed data on this page (URL, IDs, delay, PIN, token, session, API hash)?')) return;
   try { Object.keys(localStorage).filter((k) => k.startsWith('cc_')).forEach((k) => localStorage.removeItem(k)); } catch {}
   try { Object.keys(sessionStorage).filter((k) => k.startsWith('cc_')).forEach((k) => sessionStorage.removeItem(k)); } catch {}
-  ['pin', 'token', 'notifyId', 'session', 'apiId', 'apiHash', 'src', 'dst', 'from', 'to'].forEach((id) => { $(id).value = ''; });
+  ['pin', 'token', 'notifyId', 'session', 'apiId', 'apiHash', 'src', 'dst', 'from', 'to', 'srcTopic', 'dstTopic'].forEach((id) => { $(id).value = ''; });
+  ['srcGroup', 'srcForum', 'dstGroup', 'dstForum'].forEach((id) => { $(id).checked = false; });
   $('api').value = DEFAULT_URL; $('delay').value = '3'; $('notifySaved').checked = true;
-  setMode('bot');
+  setMode('bot'); syncUI();
   render({ status: 'no data', logs: [] }); $('log').textContent = 'Enter the PIN to see status.';
   say('All data cleared.', 'good');
 };
 
+syncUI();
 // show progress right after a reload (PIN comes back from this tab's session) and keep it fresh
 if ($('pin').value.length === 4) refresh(true);
 setInterval(() => { if ($('pin').value && $('api').value && !document.hidden) refresh(true); }, 5000);
