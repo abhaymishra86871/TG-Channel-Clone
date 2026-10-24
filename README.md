@@ -11,6 +11,8 @@ Two ways to copy, chosen per run on the panel:
 | | Bot token | My account (session) |
 |---|---|---|
 | Source channel | bot must be **admin** | account only needs to be a **member** |
+| Source group | bot must be a **member** | account must be a **member** |
+| Destination group | bot must be a member who can send | account must be a member who can send |
 | Destination | bot must be admin + "Post messages" | account must be admin + "Post messages" |
 | Ban risk | none for your account | **your account can be limited or banned by Telegram** (use a spare account) |
 | "Forwarded from" shown? | no | no |
@@ -28,8 +30,25 @@ The server keeps it only so a crashed or restarted job can resume, encrypted wit
 3. Add that account as admin (Post Messages ON) in the destination channel, and make sure it has joined the source channel.
 
 ## STEP 3 - Channel IDs and message IDs
-- Channel ID: forward a post from the channel to **@RawDataBot** -> `forward_from_chat.id` -> `-1001234567890`.
+- Channel / group ID: forward a message from it to **@RawDataBot** -> `forward_from_chat.id` -> `-1001234567890`.
 - Message ID: right-click a post -> Copy Post Link -> last number (`t.me/c/123/456` -> `456`).
+
+## Groups and topics
+Source and destination can each be a channel **or a group**. On the page, tick "Source is a group" / "Destination is a group"; the fields below appear only when ticked:
+- **Group has topics** -> shows a **Topic ID** box.
+  - Source topic ID (account mode only): copy just that topic. Empty = all topics. A bot cannot filter by topic, so in bot mode every topic in the ID range is copied.
+  - Destination topic ID: post into that topic. Empty (or 1) = the General topic.
+- Topic ID: right-click a message inside the topic -> Copy link -> `t.me/c/123/TOPIC/456` -> the middle number. General topic = 1.
+- Check setup verifies the tick boxes against the real chat (channel vs group, topics on/off) and tells you what to fix.
+
+## Telegram limits and the delay box
+| Case | Limit | Minimum delay |
+|---|---|---|
+| Bot -> channel or chat | 1 message / second | 1 s |
+| Bot -> group | 20 messages / minute | 3 s |
+| Your account (any destination) | 1 message / second | 1 s |
+
+The page calculates live from the number you type: messages per minute, and the time for your ID range (an upper bound, deleted IDs go faster). A warning appears only when the delay is below the limit (the server then raises it to the minimum) or within 25% above it (flood waits likely).
 
 ## STEP 4 - Upstash Redis (free, remembers progress)
 Render's free disk is wiped on redeploy/sleep. Upstash keeps the progress JSON (about 300 bytes plus encrypted credentials), never media.
