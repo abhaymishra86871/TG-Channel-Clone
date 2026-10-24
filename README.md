@@ -53,7 +53,6 @@ Environment variables:
 | `UPSTASH_REDIS_REST_URL` | from Step 4 |
 | `UPSTASH_REDIS_REST_TOKEN` | from Step 4 |
 | `BOT_TOKEN` | optional default bot token (panel field can stay empty) |
-| `API_ID`, `API_HASH` | optional, account mode: set once here so you never type them on the page |
 | `DELAY_MS` | optional default delay (ms); the page has its own "Delay (seconds)" field per run |
 
 Open `<render-url>/health` -> should say `ok`.
@@ -64,8 +63,8 @@ Add Monitor -> HTTP(s) -> `https://<render-url>/health` -> every 5 minutes. Keep
 ## STEP 8 - Use the panel
 1. Enter the **PIN** (top of the page). The server URL is prefilled. The PIN is remembered only until the tab closes, so a reload keeps showing live progress.
 2. Choose **Bot token** or **My account**.
-   - *Already have a session string?* Paste it. API ID/hash are optional if `API_ID`/`API_HASH` are set on Render (otherwise type them once; the library needs a valid pair).
-   - *No session yet:* **Generate session (OTP)** -> phone number with country code -> code from your Telegram app -> 2-step password if you have one -> the session is filled in. Save it in a password manager.
+   - *Already have a session string?* Enter API ID + API hash + the session string, and skip the OTP step.
+   - *No session yet:* enter API ID + API hash, then **Generate session (OTP)** -> phone number with country code -> code from your Telegram app -> 2-step password if you have one -> the session is filled in. Save it in a password manager.
 3. Enter source/destination IDs, start/end message IDs and the delay in seconds.
 4. Progress messages (optional): bot mode -> your Telegram user ID (you must have pressed Start on the bot); account mode -> tick "Show progress in Saved Messages".
 5. **Check setup** -> popup shows the bot/account name, both channel names with admin status, and whether progress messages can be delivered. Fix any red items.
